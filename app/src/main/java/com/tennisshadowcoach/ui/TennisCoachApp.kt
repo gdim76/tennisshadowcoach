@@ -246,6 +246,12 @@ private fun AnalysisResultCard(
             MetricRow("Кадры с найденной позой", "${analysis.detectedPoseFrames} из ${analysis.processedFrames}")
             MetricRow("Скорость обработки", "${"%.1f".format(analysis.processingFps)} кадр/с")
             MetricRow("Найдено замахов", analysis.motion.swings.size.toString())
+            analysis.motion.swings.forEachIndexed { index, swing ->
+                Text(
+                    "Замах ${index + 1}: ${swing.durationMs} мс · пик ${"%.2f".format(swing.peakSpeed)} торса/с",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
             Text(
                 "Сырые image и world-координаты 33 точек сохранены в CSV рядом с записью.",
                 style = MaterialTheme.typography.bodySmall,
