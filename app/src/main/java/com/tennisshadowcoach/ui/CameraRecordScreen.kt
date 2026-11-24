@@ -1,0 +1,192 @@
+package com.tennisshadowcoach.ui
+
+import android.net.Uri
+import android.util.Range
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.video.FileOutputOptions
+import androidx.camera.video.Quality
+import androidx.camera.video.QualitySelector
+import androidx.camera.video.Recorder
+import androidx.camera.video.VideoCapture
+import androidx.camera.video.VideoRecordEvent
+import androidx.camera.view.PreviewView
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Cameraswitch
+import androidx.compose.material.icons.filled.FiberManualRecord
+import androidx.compose.material3.Button
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import java.io.File
+
+@Composable
+fun CameraRecordScreen(
+    onBack: () -> Unit,
+    onVideoSaved: (Uri) -> Unit
+) {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val mainExecutor = remember(context) { ContextCompat.getMainExecutor(context) }
+    var lensFacing by remember { mutableIntStateOf(CameraSelector.LENS_FACING_BACK) }
+    var videoCapture by remember { mutableStateOf<VideoCapture<Recorder>?>(null) }
+    var recording by remember { mutableStateOf<androidx.camera.video.Recording?>(null) }
+    var recordingNow by remember { mutableStateOf(false) }
+    var cameraError by remember { mutableStateOf<String?>(null) }
+
+    Column(
+        Modifier.fillMaxSize().padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            IconButton(onClick = onBack) {
+                Icon(Icons.Default.ArrowBack, contentDescription = "Назад")
+            }
+            Column(Modifier.weight(1f)) {
+                Text("Запись упражнения", style = MaterialTheme.typography.titleLarge)
+                Text(
+                    if (lensFacing == CameraSelector.LENS_FACING_BACK) "Тыловая камера · целевой режим 30 кадров/с"
+                    else "Фронтальная камера · целевой режим 30 кадров/с",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            IconButton(
+                enabled = !recordingNow,
+                onClick = {
+                    lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK) {
+                        CameraSelector.LENS_FACING_FRONT
+                    } else {
+                        CameraSelector.LENS_FACING_BACK
+                    }
+                }
+            ) {
+                Icon(Icons.Default.Cameraswitch, contentDescription = "Сменить камеру")
+            }
+        }
+
+        CameraPreview(
+            lensFacing = lensFacing,
+            onCaptureReady = { videoCapture = it },
+            onError = { cameraError = it }
+        )
+
+        cameraError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+
+        Text(
+            "Поставь телефон неподвижно примерно в 2,5–3 м. В кадре должны быть голова, стопы и ракетка.",
+            style = MaterialTheme.typography.bodySmall
+        )
+
+        Button(
+            modifier = Modifier.fillMaxWidth(),
+            enabled = videoCapture != null,
+            onClick = {
+                val capture = videoCapture ?: return@Button
+                if (recordingNow) {
+                    recording?.stop()
+                } else {
+                    val moviesDir = File(context.getExternalFilesDir(null), "TennisShadowCoach")
+                    moviesDir.mkdirs()
+                    val outputFile = File(moviesDir, "training_${System.currentTimeMillis()}.mp4")
+                    recording = capture.output
+                        .prepareRecording(context, FileOutputOptions.Builder(outputFile).build())
+                        .start(mainExecutor) { event ->
+                            when (event) {
+                                is VideoRecordEvent.Start -> recordingNow = true
+                                is VideoRecordEvent.Finalize -> {
+                                    recordingNow = false
+                                    recording = null
+                                    if (event.hasError()) {
+                                        cameraError = "Ошибка записи видео: ${event.error}"
+                                    } else {
+                                        onVideoSaved(Uri.fromFile(outputFile))
+                                    }
+                                }
+                            }
+                        }
+                }
+            }
+        ) {
+            Icon(Icons.Default.FiberManualRecord, contentDescription = null)
+            Spacer(Modifier.width(8.dp))
+            Text(if (recordingNow) "Остановить запись" else "Начать запись")
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose { recording?.stop() }
+    }
+}
+
+@Composable
+private fun CameraPreview(
+    lensFacing: Int,
+    onCaptureReady: (VideoCapture<Recorder>) -> Unit,
+    onError: (String) -> Unit
+) {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val mainExecutor = remember(context) { ContextCompat.getMainExecutor(context) }
+
+    key(lensFacing) {
+        AndroidView(
+            modifier = Modifier.fillMaxWidth().height(420.dp),
+            factory = { viewContext ->
+                PreviewView(viewContext).apply {
+                    scaleType = PreviewView.ScaleType.FIT_CENTER
+                    val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
+                    cameraProviderFuture.addListener({
+                        try {
+                            val provider = cameraProviderFuture.get()
+                            val preview = Preview.Builder().build().also {
+                                it.surfaceProvider = surfaceProvider
+                            }
+                            val recorder = Recorder.Builder()
+                                .setQualitySelector(QualitySelector.from(Quality.HD))
+                                .build()
+                            val capture = VideoCapture.Builder(recorder)
+                                .setTargetFrameRate(Range(30, 30))
+                                .build()
+                            provider.unbindAll()
+                            provider.bindToLifecycle(
+                                lifecycleOwner,
+                                CameraSelector.Builder().requireLensFacing(lensFacing).build(),
+                                preview,
+                                capture
+                            )
+                            onCaptureReady(capture)
+                        } catch (error: Throwable) {
+                            onError(error.message ?: "Не удалось запустить камеру.")
+                        }
+                    }, mainExecutor)
+                }
+            }
+        )
+    }
+}
