@@ -26,7 +26,8 @@ data class MetricsConfig(
     val angleSmoothingWindowFrames: Int = 9,
     val reliableFrameFraction: Float = 0.7f,
     val swingSpeedThreshold: Float = 1.1f,
-    val minSwingDurationMs: Long = 120L
+    val minSwingDurationMs: Long = 120L,
+    val minGapBetweenSwingsMs: Long = 550L
 )
 
 data class MetricReading(
@@ -158,7 +159,21 @@ object MotionMetricsEngine {
                 start = null
             }
         }
-        return result
+        return result.fold(mutableListOf()) { merged, segment ->
+            val previous = merged.lastOrNull()
+            if (previous != null && segment.startTimestampUs / 1_000L - (previous.startTimestampUs / 1_000L + previous.durationMs) <= config.minGapBetweenSwingsMs) {
+                val peak = if (segment.peakSpeed > previous.peakSpeed) segment else previous
+                merged[merged.lastIndex] = SwingSegment(
+                    startFrame = previous.startFrame,
+                    peakFrame = peak.peakFrame,
+                    endFrame = segment.endFrame,
+                    startTimestampUs = previous.startTimestampUs,
+                    peakSpeed = peak.peakSpeed,
+                    durationMs = (frames[segment.endFrame].timestampUs - previous.startTimestampUs) / 1_000L
+                )
+            } else merged += segment
+            merged
+        }
     }
 
     private fun cleanImageTracks(frames: List<PoseFrame>, config: MetricsConfig): List<List<ImageLandmark?>> =
