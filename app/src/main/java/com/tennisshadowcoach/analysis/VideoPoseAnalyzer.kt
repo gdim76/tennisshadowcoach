@@ -31,7 +31,9 @@ data class AnalysisConfig(
     val visibilityThreshold: Float = 0.5f,
     val maxLandmarkJumpPerSecond: Float = 6f,
     val speedSmoothingWindowFrames: Int = 5,
-    val angleSmoothingWindowFrames: Int = 9
+    val angleSmoothingWindowFrames: Int = 9,
+    val leadingHand: LeadingHand = LeadingHand.RIGHT,
+    val recordingAngle: RecordingAngle = RecordingAngle.SIDE
 )
 
 data class ImageLandmark(
@@ -65,7 +67,8 @@ data class VideoAnalysis(
     val csvFile: File,
     val metadataFile: File,
     val elapsedSeconds: Float,
-    val processingFps: Float
+    val processingFps: Float,
+    val motion: MotionAnalysis
 ) {
     val processedFrames: Int get() = frames.size
     val detectedPoseFrames: Int get() = frames.count { frame -> frame.landmarks.any { it != null } }
@@ -173,7 +176,18 @@ class VideoPoseAnalyzer(
             csvFile = csvFile,
             metadataFile = exportFiles.metadataFile,
             elapsedSeconds = elapsedSeconds,
-            processingFps = if (elapsedSeconds == 0f) 0f else frames.size / elapsedSeconds
+            processingFps = if (elapsedSeconds == 0f) 0f else frames.size / elapsedSeconds,
+            motion = MotionMetricsEngine.analyze(
+                frames = frames,
+                leadingHand = config.leadingHand,
+                recordingAngle = config.recordingAngle,
+                config = MetricsConfig(
+                    visibilityThreshold = config.visibilityThreshold,
+                    maxLandmarkJumpPerSecond = config.maxLandmarkJumpPerSecond,
+                    speedSmoothingWindowFrames = config.speedSmoothingWindowFrames,
+                    angleSmoothingWindowFrames = config.angleSmoothingWindowFrames
+                )
+            )
         )
     }
 
@@ -299,6 +313,8 @@ private object AnalysisMetadataExporter {
                 "max_landmark_jump_per_second": ${config.maxLandmarkJumpPerSecond},
                 "speed_smoothing_window_frames": ${config.speedSmoothingWindowFrames},
                 "angle_smoothing_window_frames": ${config.angleSmoothingWindowFrames}
+                ,"leading_hand": "${config.leadingHand.name.lowercase()}"
+                ,"recording_angle": "${config.recordingAngle.name.lowercase()}"
               }
             }
             """.trimIndent()

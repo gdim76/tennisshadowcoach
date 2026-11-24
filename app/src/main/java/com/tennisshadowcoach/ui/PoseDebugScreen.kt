@@ -106,6 +106,16 @@ fun PoseDebugScreen(
             "Кадр ${selectedFrame.index + 1}: ${selectedFrame.timestampUs / 1_000L} мс",
             style = MaterialTheme.typography.bodySmall
         )
+        analysis.motion.frames.getOrNull(selectedIndex)?.let { metrics ->
+            val values = metrics.readings.values.mapNotNull { reading -> reading.preferred }
+            if (values.isNotEmpty()) {
+                Text(
+                    "Текущие 3D-значения: ${values.take(3).joinToString { "%.1f".format(it) }}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
 
         FrameWithPoseOverlay(
             previewJpeg = analysis.previewJpegs.getOrNull(selectedIndex),

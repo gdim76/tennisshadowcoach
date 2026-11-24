@@ -24,6 +24,7 @@ import androidx.compose.material.icons.filled.Insights
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -44,6 +45,9 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import com.tennisshadowcoach.analysis.AnalysisProgress
+import com.tennisshadowcoach.analysis.AnalysisConfig
+import com.tennisshadowcoach.analysis.LeadingHand
+import com.tennisshadowcoach.analysis.RecordingAngle
 import com.tennisshadowcoach.analysis.VideoAnalysis
 import com.tennisshadowcoach.analysis.VideoPoseAnalyzer
 import kotlinx.coroutines.Dispatchers
@@ -62,6 +66,8 @@ fun TennisCoachApp() {
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var showCamera by remember { mutableStateOf(false) }
     var showDebug by remember { mutableStateOf(false) }
+    var leadingHand by remember { mutableStateOf(LeadingHand.RIGHT) }
+    var recordingAngle by remember { mutableStateOf(RecordingAngle.SIDE) }
 
     val cameraPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -123,6 +129,22 @@ fun TennisCoachApp() {
                 }
             }
 
+            Card {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Параметры M1", style = MaterialTheme.typography.titleMedium)
+                    Text("Ведущая рука", style = MaterialTheme.typography.bodySmall)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(leadingHand == LeadingHand.RIGHT, { leadingHand = LeadingHand.RIGHT }, label = { Text("Правая") })
+                        FilterChip(leadingHand == LeadingHand.LEFT, { leadingHand = LeadingHand.LEFT }, label = { Text("Левая") })
+                    }
+                    Text("Ракурс", style = MaterialTheme.typography.bodySmall)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(recordingAngle == RecordingAngle.SIDE, { recordingAngle = RecordingAngle.SIDE }, label = { Text("Сбоку") })
+                        FilterChip(recordingAngle == RecordingAngle.FRONT_OR_45, { recordingAngle = RecordingAngle.FRONT_OR_45 }, label = { Text("Спереди / 45°") })
+                    }
+                }
+            }
+
             Button(
                 onClick = {
                     if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
@@ -159,7 +181,10 @@ fun TennisCoachApp() {
                                 scope.launch {
                                     try {
                                         analysis = withContext(Dispatchers.IO) {
-                                            VideoPoseAnalyzer(context).analyze(selectedVideo) { update -> progress = update }
+                                            VideoPoseAnalyzer(
+                                                context,
+                                                AnalysisConfig(leadingHand = leadingHand, recordingAngle = recordingAngle)
+                                            ).analyze(selectedVideo) { update -> progress = update }
                                         }
                                     } catch (error: Throwable) {
                                         errorMessage = error.message ?: "Не удалось проанализировать видео."
@@ -216,10 +241,11 @@ private fun AnalysisResultCard(
 ) {
     Card {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("Результат M0", style = MaterialTheme.typography.titleLarge)
+            Text("Результат анализа", style = MaterialTheme.typography.titleLarge)
             MetricRow("Обработано кадров", analysis.processedFrames.toString())
             MetricRow("Кадры с найденной позой", "${analysis.detectedPoseFrames} из ${analysis.processedFrames}")
             MetricRow("Скорость обработки", "${"%.1f".format(analysis.processingFps)} кадр/с")
+            MetricRow("Найдено замахов", analysis.motion.swings.size.toString())
             Text(
                 "Сырые image и world-координаты 33 точек сохранены в CSV рядом с записью.",
                 style = MaterialTheme.typography.bodySmall,
