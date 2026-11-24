@@ -48,7 +48,7 @@ fun PoseDebugScreen(
     var selectedIndex by remember { mutableIntStateOf(0) }
     var showSmoothed by remember { mutableStateOf(false) }
     val smoothed = remember(analysis) {
-        smoothedLandmarks(analysis.frames, AnalysisConfig().smoothingWindowFrames)
+        smoothedLandmarks(analysis.frames, AnalysisConfig().angleSmoothingWindowFrames)
     }
     val selectedFrame = analysis.frames[selectedIndex]
     val landmarks = if (showSmoothed) smoothed[selectedIndex] else selectedFrame.landmarks

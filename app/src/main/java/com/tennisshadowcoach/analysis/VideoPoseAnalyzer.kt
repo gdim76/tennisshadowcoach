@@ -18,11 +18,20 @@ import java.io.ByteArrayOutputStream
 import java.io.PrintWriter
 import kotlin.math.max
 
+enum class PoseModelVariant(val assetPath: String) {
+    LITE("pose_landmarker_lite.task"),
+    FULL("pose_landmarker_full.task")
+}
+
 /** Values used by the M0 data-capture pipeline. Change them in one place. */
 data class AnalysisConfig(
-    val modelAssetPath: String = "pose_landmarker_lite.task",
+    val modelVariant: PoseModelVariant = PoseModelVariant.LITE,
+    val modelAssetPath: String = modelVariant.assetPath,
     val detectionConfidence: Float = 0.5f,
-    val smoothingWindowFrames: Int = 5
+    val visibilityThreshold: Float = 0.5f,
+    val maxLandmarkJumpPerSecond: Float = 6f,
+    val speedSmoothingWindowFrames: Int = 5,
+    val angleSmoothingWindowFrames: Int = 9
 )
 
 data class ImageLandmark(
@@ -54,6 +63,7 @@ data class VideoAnalysis(
     /** Compact previews captured from the exact frames passed to MediaPipe. */
     val previewJpegs: List<ByteArray?>,
     val csvFile: File,
+    val metadataFile: File,
     val elapsedSeconds: Float,
     val processingFps: Float
 ) {
@@ -85,7 +95,8 @@ class VideoPoseAnalyzer(
             .setMinTrackingConfidence(config.detectionConfidence)
             .build()
 
-        val csvFile = csvDestination(videoUri)
+        val exportFiles = exportDestinations(videoUri)
+        val csvFile = exportFiles.csvFile
         val startedAtNs = System.nanoTime()
         val frames = ArrayList<PoseFrame>(timestampsUs.size)
         val previewJpegs = ArrayList<ByteArray?>(timestampsUs.size)
@@ -95,6 +106,12 @@ class VideoPoseAnalyzer(
 
         try {
             retriever.setDataSource(context, videoUri)
+            val videoMetadata = VideoMetadata(
+                width = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull(),
+                height = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull(),
+                rotationDegrees = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
+                    ?.toIntOrNull() ?: 0
+            )
             PrintWriter(csvFile).use { csv ->
                 csv.println(CsvLandmarkExporter.header())
                 timestampsUs.forEachIndexed { index, timestampUs ->
@@ -139,8 +156,10 @@ class VideoPoseAnalyzer(
                     )
                 }
             }
+            AnalysisMetadataExporter.write(exportFiles.metadataFile, videoMetadata, config)
         } catch (error: Throwable) {
             csvFile.delete()
+            exportFiles.metadataFile.delete()
             throw error
         } finally {
             retriever.release()
@@ -152,6 +171,7 @@ class VideoPoseAnalyzer(
             frames = frames,
             previewJpegs = previewJpegs,
             csvFile = csvFile,
+            metadataFile = exportFiles.metadataFile,
             elapsedSeconds = elapsedSeconds,
             processingFps = if (elapsedSeconds == 0f) 0f else frames.size / elapsedSeconds
         )
@@ -179,12 +199,16 @@ class VideoPoseAnalyzer(
         }
     }
 
-    private fun csvDestination(videoUri: Uri): File {
+    private fun exportDestinations(videoUri: Uri): ExportFiles {
         val videoFile = videoUri.path?.let(::File)?.takeIf { videoUri.scheme == "file" }
         val directory = videoFile?.parentFile
             ?: File(context.getExternalFilesDir(null), "TennisShadowCoach")
         directory.mkdirs()
-        return File(directory, "landmarks_${System.currentTimeMillis()}.csv")
+        val prefix = "landmarks_${System.currentTimeMillis()}"
+        return ExportFiles(
+            csvFile = File(directory, "$prefix.csv"),
+            metadataFile = File(directory, "$prefix.metadata.json")
+        )
     }
 
     private fun Bitmap.asArgb8888(): Bitmap =
@@ -248,6 +272,40 @@ class VideoPoseAnalyzer(
         const val DEBUG_PREVIEW_WIDTH_PX = 320
         const val DEBUG_PREVIEW_JPEG_QUALITY = 70
     }
+}
+
+private data class ExportFiles(val csvFile: File, val metadataFile: File)
+
+private data class VideoMetadata(
+    val width: Int?,
+    val height: Int?,
+    val rotationDegrees: Int
+)
+
+/** Sidecar data makes a raw landmark CSV reproducible outside the app. */
+private object AnalysisMetadataExporter {
+    fun write(file: File, video: VideoMetadata, config: AnalysisConfig) {
+        file.writeText(
+            """
+            {
+              "video": {
+                "width": ${video.width.jsonNumber()},
+                "height": ${video.height.jsonNumber()},
+                "rotation_degrees": ${video.rotationDegrees}
+              },
+              "pose_model": "${config.modelVariant.name.lowercase()}",
+              "config": {
+                "visibility_threshold": ${config.visibilityThreshold},
+                "max_landmark_jump_per_second": ${config.maxLandmarkJumpPerSecond},
+                "speed_smoothing_window_frames": ${config.speedSmoothingWindowFrames},
+                "angle_smoothing_window_frames": ${config.angleSmoothingWindowFrames}
+              }
+            }
+            """.trimIndent()
+        )
+    }
+
+    private fun Int?.jsonNumber(): String = this?.toString() ?: "null"
 }
 
 /** CSV is intentionally flat so it can be opened directly in a spreadsheet. */
