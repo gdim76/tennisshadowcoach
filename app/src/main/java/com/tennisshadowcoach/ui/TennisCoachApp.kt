@@ -65,6 +65,7 @@ fun TennisCoachApp() {
     var progress by remember { mutableStateOf<AnalysisProgress?>(null) }
     var analyzing by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
+    var recordingNotice by remember { mutableStateOf<String?>(null) }
     var showCamera by remember { mutableStateOf(false) }
     var showDebug by remember { mutableStateOf(false) }
     var leadingHand by remember { mutableStateOf(LeadingHand.RIGHT) }
@@ -81,10 +82,11 @@ fun TennisCoachApp() {
     if (showCamera) {
         CameraRecordScreen(
             onBack = { showCamera = false },
-            onVideoSaved = {
-                videoUri = it
+            onVideoSaved = { uri, notice ->
+                videoUri = uri
                 analysis = null
                 progress = null
+                recordingNotice = notice
                 showCamera = false
             }
         )
@@ -230,6 +232,9 @@ fun TennisCoachApp() {
             }
 
             errorMessage?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            recordingNotice?.let {
+                Text(it, color = MaterialTheme.colorScheme.primary)
+            }
 
             analysis?.let { result ->
                 AnalysisResultCard(
