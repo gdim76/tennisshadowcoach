@@ -53,6 +53,7 @@ import com.tennisshadowcoach.analysis.VideoPoseAnalyzer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -68,6 +69,7 @@ fun TennisCoachApp() {
     var showDebug by remember { mutableStateOf(false) }
     var leadingHand by remember { mutableStateOf(LeadingHand.RIGHT) }
     var recordingAngle by remember { mutableStateOf(RecordingAngle.SIDE) }
+    val latestRecording = remember(context) { findLatestRecording(context) }
 
     val cameraPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -156,6 +158,13 @@ fun TennisCoachApp() {
                 Icon(Icons.Default.CameraAlt, contentDescription = null)
                 Spacer(Modifier.padding(horizontal = 4.dp))
                 Text("Записать тренировку")
+            }
+
+            if (videoUri == null && latestRecording != null) {
+                Button(
+                    onClick = { videoUri = Uri.fromFile(latestRecording) },
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Открыть последнюю запись") }
             }
 
             videoUri?.let { selectedVideo ->
@@ -287,3 +296,8 @@ private fun shareCsv(context: android.content.Context, file: java.io.File) {
         .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     context.startActivity(Intent.createChooser(shareIntent, "Экспорт CSV"))
 }
+
+private fun findLatestRecording(context: android.content.Context): File? =
+    File(context.getExternalFilesDir(null), "TennisShadowCoach")
+        .listFiles { file -> file.extension.equals("mp4", ignoreCase = true) }
+        ?.maxByOrNull(File::lastModified)
