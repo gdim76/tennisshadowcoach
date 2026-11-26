@@ -56,4 +56,6 @@ dependencies {
 
     // MediaPipe Pose Landmarker (video mode)
     implementation("com.google.mediapipe:tasks-vision:latest.release")
+
+    testImplementation("junit:junit:4.13.2")
 }

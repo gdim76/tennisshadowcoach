@@ -1,11 +1,14 @@
 package com.tennisshadowcoach.ui
 
+import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.util.Log
 import android.util.Range
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FileOutputOptions
+import androidx.camera.video.OutputOptions
 import androidx.camera.video.Quality
 import androidx.camera.video.QualitySelector
 import androidx.camera.video.Recorder
@@ -49,7 +52,7 @@ import java.io.File
 @Composable
 fun CameraRecordScreen(
     onBack: () -> Unit,
-    onVideoSaved: (Uri) -> Unit
+    onVideoSaved: (Uri, String?) -> Unit
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -115,7 +118,14 @@ fun CameraRecordScreen(
                     moviesDir.mkdirs()
                     val outputFile = File(moviesDir, "training_${System.currentTimeMillis()}.mp4")
                     recording = capture.output
-                        .prepareRecording(context, FileOutputOptions.Builder(outputFile).build())
+                        .prepareRecording(
+                            context,
+                            FileOutputOptions.Builder(outputFile)
+                                // Be explicit: recordings must not stop at a product-defined duration or size.
+                                .setDurationLimitMillis(OutputOptions.DURATION_UNLIMITED.toLong())
+                                .setFileSizeLimit(OutputOptions.FILE_SIZE_UNLIMITED.toLong())
+                                .build()
+                        )
                         .start(mainExecutor) { event ->
                             when (event) {
                                 is VideoRecordEvent.Start -> recordingNow = true
@@ -123,9 +133,25 @@ fun CameraRecordScreen(
                                     recordingNow = false
                                     recording = null
                                     if (event.hasError()) {
-                                        cameraError = "Ошибка записи видео: ${event.error}"
+                                        val reason = event.errorDescription()
+                                        Log.w(
+                                            CAMERA_LOG_TAG,
+                                            "Recording finalized with ${event.error} ($reason), " +
+                                                "bytes=${event.recordingStats.numBytesRecorded}, " +
+                                                "durationMs=${event.recordingStats.recordedDurationNanos / 1_000_000}, " +
+                                                "file=${outputFile.absolutePath}",
+                                            event.cause
+                                        )
+                                        if (outputFile.isReadableVideo()) {
+                                            onVideoSaved(
+                                                Uri.fromFile(outputFile),
+                                                "Камера завершила запись: $reason. Видеофайл сохранён и доступен для анализа."
+                                            )
+                                        } else {
+                                            cameraError = "Запись не сохранена: $reason"
+                                        }
                                     } else {
-                                        onVideoSaved(Uri.fromFile(outputFile))
+                                        onVideoSaved(Uri.fromFile(outputFile), null)
                                     }
                                 }
                             }
@@ -143,6 +169,38 @@ fun CameraRecordScreen(
         onDispose { recording?.stop() }
     }
 }
+
+private fun VideoRecordEvent.Finalize.errorDescription(): String = when (error) {
+    VideoRecordEvent.Finalize.ERROR_FILE_SIZE_LIMIT_REACHED -> "достигнут лимит размера файла"
+    VideoRecordEvent.Finalize.ERROR_INSUFFICIENT_STORAGE -> "недостаточно места в памяти"
+    VideoRecordEvent.Finalize.ERROR_SOURCE_INACTIVE -> "камера перестала передавать кадры"
+    VideoRecordEvent.Finalize.ERROR_INVALID_OUTPUT_OPTIONS -> "некорректные параметры сохранения"
+    VideoRecordEvent.Finalize.ERROR_ENCODING_FAILED -> "ошибка кодирования видео"
+    VideoRecordEvent.Finalize.ERROR_RECORDER_ERROR -> "ошибка рекордера камеры"
+    VideoRecordEvent.Finalize.ERROR_NO_VALID_DATA -> "камера не передала корректные кадры"
+    VideoRecordEvent.Finalize.ERROR_DURATION_LIMIT_REACHED -> "достигнут лимит длительности"
+    VideoRecordEvent.Finalize.ERROR_RECORDING_GARBAGE_COLLECTED -> "объект записи был преждевременно освобождён"
+    VideoRecordEvent.Finalize.ERROR_UNKNOWN -> "неизвестная ошибка камеры"
+    else -> "неизвестный код ошибки ($error)"
+}
+
+private fun File.isReadableVideo(): Boolean {
+    if (!exists() || length() == 0L) return false
+    val retriever = MediaMetadataRetriever()
+    return try {
+        retriever.setDataSource(absolutePath)
+        retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+            ?.toLongOrNull()
+            ?.let { it > 0L }
+            ?: false
+    } catch (_: Throwable) {
+        false
+    } finally {
+        retriever.release()
+    }
+}
+
+private const val CAMERA_LOG_TAG = "TennisCamera"
 
 @Composable
 private fun CameraPreview(

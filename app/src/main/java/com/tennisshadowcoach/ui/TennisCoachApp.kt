@@ -24,6 +24,7 @@ import androidx.compose.material.icons.filled.Insights
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -44,11 +45,15 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import com.tennisshadowcoach.analysis.AnalysisProgress
+import com.tennisshadowcoach.analysis.AnalysisConfig
+import com.tennisshadowcoach.analysis.LeadingHand
+import com.tennisshadowcoach.analysis.RecordingAngle
 import com.tennisshadowcoach.analysis.VideoAnalysis
 import com.tennisshadowcoach.analysis.VideoPoseAnalyzer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -60,8 +65,12 @@ fun TennisCoachApp() {
     var progress by remember { mutableStateOf<AnalysisProgress?>(null) }
     var analyzing by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
+    var recordingNotice by remember { mutableStateOf<String?>(null) }
     var showCamera by remember { mutableStateOf(false) }
     var showDebug by remember { mutableStateOf(false) }
+    var leadingHand by remember { mutableStateOf(LeadingHand.RIGHT) }
+    var recordingAngle by remember { mutableStateOf(RecordingAngle.SIDE) }
+    val latestRecording = remember(context) { findLatestRecording(context) }
 
     val cameraPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -73,10 +82,11 @@ fun TennisCoachApp() {
     if (showCamera) {
         CameraRecordScreen(
             onBack = { showCamera = false },
-            onVideoSaved = {
-                videoUri = it
+            onVideoSaved = { uri, notice ->
+                videoUri = uri
                 analysis = null
                 progress = null
+                recordingNotice = notice
                 showCamera = false
             }
         )
@@ -123,6 +133,22 @@ fun TennisCoachApp() {
                 }
             }
 
+            Card {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Параметры M1", style = MaterialTheme.typography.titleMedium)
+                    Text("Ведущая рука", style = MaterialTheme.typography.bodySmall)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(leadingHand == LeadingHand.RIGHT, { leadingHand = LeadingHand.RIGHT }, label = { Text("Правая") })
+                        FilterChip(leadingHand == LeadingHand.LEFT, { leadingHand = LeadingHand.LEFT }, label = { Text("Левая") })
+                    }
+                    Text("Ракурс", style = MaterialTheme.typography.bodySmall)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(recordingAngle == RecordingAngle.SIDE, { recordingAngle = RecordingAngle.SIDE }, label = { Text("Сбоку") })
+                        FilterChip(recordingAngle == RecordingAngle.FRONT_OR_45, { recordingAngle = RecordingAngle.FRONT_OR_45 }, label = { Text("Спереди / 45°") })
+                    }
+                }
+            }
+
             Button(
                 onClick = {
                     if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
@@ -134,6 +160,13 @@ fun TennisCoachApp() {
                 Icon(Icons.Default.CameraAlt, contentDescription = null)
                 Spacer(Modifier.padding(horizontal = 4.dp))
                 Text("Записать тренировку")
+            }
+
+            if (videoUri == null && latestRecording != null) {
+                Button(
+                    onClick = { videoUri = Uri.fromFile(latestRecording) },
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Открыть последнюю запись") }
             }
 
             videoUri?.let { selectedVideo ->
@@ -159,7 +192,10 @@ fun TennisCoachApp() {
                                 scope.launch {
                                     try {
                                         analysis = withContext(Dispatchers.IO) {
-                                            VideoPoseAnalyzer(context).analyze(selectedVideo) { update -> progress = update }
+                                            VideoPoseAnalyzer(
+                                                context,
+                                                AnalysisConfig(leadingHand = leadingHand, recordingAngle = recordingAngle)
+                                            ).analyze(selectedVideo) { update -> progress = update }
                                         }
                                     } catch (error: Throwable) {
                                         errorMessage = error.message ?: "Не удалось проанализировать видео."
@@ -196,12 +232,16 @@ fun TennisCoachApp() {
             }
 
             errorMessage?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            recordingNotice?.let {
+                Text(it, color = MaterialTheme.colorScheme.primary)
+            }
 
             analysis?.let { result ->
                 AnalysisResultCard(
                     analysis = result,
                     onOpenDebug = { showDebug = true },
-                    onShareCsv = { shareCsv(context, result.csvFile) }
+                    onShareCsv = { shareCsv(context, result.csvFile) },
+                    onShareSwingsCsv = { shareCsv(context, result.swingsCsvFile) }
                 )
             }
         }
@@ -212,16 +252,24 @@ fun TennisCoachApp() {
 private fun AnalysisResultCard(
     analysis: VideoAnalysis,
     onOpenDebug: () -> Unit,
-    onShareCsv: () -> Unit
+    onShareCsv: () -> Unit,
+    onShareSwingsCsv: () -> Unit
 ) {
     Card {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("Результат M0", style = MaterialTheme.typography.titleLarge)
+            Text("Результат анализа", style = MaterialTheme.typography.titleLarge)
             MetricRow("Обработано кадров", analysis.processedFrames.toString())
             MetricRow("Кадры с найденной позой", "${analysis.detectedPoseFrames} из ${analysis.processedFrames}")
             MetricRow("Скорость обработки", "${"%.1f".format(analysis.processingFps)} кадр/с")
+            MetricRow("Найдено замахов", analysis.motion.swings.size.toString())
+            analysis.motion.swings.forEachIndexed { index, swing ->
+                Text(
+                    "Замах ${index + 1}: ${swing.durationMs} мс · пик ${"%.2f".format(swing.peakSpeed)} торса/с",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
             Text(
-                "Сырые image и world-координаты 33 точек сохранены в CSV рядом с записью.",
+                "Сырые точки и отдельный CSV замахов с метриками сохранены рядом с записью.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -234,6 +282,11 @@ private fun AnalysisResultCard(
                 Icon(Icons.Default.FileDownload, contentDescription = null)
                 Spacer(Modifier.padding(horizontal = 4.dp))
                 Text("Экспортировать CSV")
+            }
+            Button(onClick = onShareSwingsCsv, modifier = Modifier.fillMaxWidth()) {
+                Icon(Icons.Default.FileDownload, contentDescription = null)
+                Spacer(Modifier.padding(horizontal = 4.dp))
+                Text("Экспортировать CSV замахов")
             }
         }
     }
@@ -255,3 +308,8 @@ private fun shareCsv(context: android.content.Context, file: java.io.File) {
         .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     context.startActivity(Intent.createChooser(shareIntent, "Экспорт CSV"))
 }
+
+private fun findLatestRecording(context: android.content.Context): File? =
+    File(context.getExternalFilesDir(null), "TennisShadowCoach")
+        .listFiles { file -> file.extension.equals("mp4", ignoreCase = true) }
+        ?.maxByOrNull(File::lastModified)

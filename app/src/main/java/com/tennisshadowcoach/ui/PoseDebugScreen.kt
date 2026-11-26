@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -32,9 +33,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
+import com.tennisshadowcoach.analysis.SwingDebugData
+import com.tennisshadowcoach.analysis.SwingMetrics
+import com.tennisshadowcoach.analysis.MetricSummary
 import com.tennisshadowcoach.analysis.AnalysisConfig
 import com.tennisshadowcoach.analysis.ImageLandmark
 import com.tennisshadowcoach.analysis.VideoAnalysis
@@ -48,7 +53,7 @@ fun PoseDebugScreen(
     var selectedIndex by remember { mutableIntStateOf(0) }
     var showSmoothed by remember { mutableStateOf(false) }
     val smoothed = remember(analysis) {
-        smoothedLandmarks(analysis.frames, AnalysisConfig().smoothingWindowFrames)
+        smoothedLandmarks(analysis.frames, AnalysisConfig().angleSmoothingWindowFrames)
     }
     val selectedFrame = analysis.frames[selectedIndex]
     val landmarks = if (showSmoothed) smoothed[selectedIndex] else selectedFrame.landmarks
@@ -106,6 +111,22 @@ fun PoseDebugScreen(
             "Кадр ${selectedFrame.index + 1}: ${selectedFrame.timestampUs / 1_000L} мс",
             style = MaterialTheme.typography.bodySmall
         )
+        analysis.motion.frames.getOrNull(selectedIndex)?.let { metrics ->
+            val values = metrics.readings
+                .filterKeys { it != com.tennisshadowcoach.analysis.MetricId.WRIST_SPEED }
+                .mapNotNull { (metric, reading) ->
+                    val world = formatAngle(reading.world3d)
+                    val image = formatAngle(reading.image2d)
+                    if (world == "—" && image == "—") null else "${metric.label}: 3D $world, 2D $image"
+                }
+            if (values.isNotEmpty()) {
+                Text(
+                    "Текущие значения: ${values.joinToString(" · ")}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
 
         FrameWithPoseOverlay(
             previewJpeg = analysis.previewJpegs.getOrNull(selectedIndex),
@@ -122,8 +143,107 @@ fun PoseDebugScreen(
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
+
+        SwingCharts(
+            debug = analysis.motion.debug,
+            metrics = analysis.motion.swingMetrics,
+            modifier = Modifier.fillMaxWidth()
+        )
     }
 }
+
+@Composable
+private fun SwingCharts(debug: SwingDebugData, metrics: List<SwingMetrics>, modifier: Modifier = Modifier) {
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("Циклы замахов", style = MaterialTheme.typography.titleMedium)
+        Text(
+            "Координата ведущего запястья: линии — пороги начала/возврата, заливка — найденные окна.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        MotionChart(
+            values = debug.coordinate,
+            segments = debug.allSegments,
+            lowerThreshold = debug.lowerThreshold,
+            upperThreshold = debug.upperThreshold,
+            lineColor = Color(0xFF9C6CFF),
+            modifier = Modifier.fillMaxWidth().height(150.dp)
+        )
+        Text("Скорость запястья, длин торса/с", style = MaterialTheme.typography.bodySmall)
+        MotionChart(
+            values = debug.wristSpeed,
+            segments = emptyList(),
+            lowerThreshold = null,
+            upperThreshold = null,
+            lineColor = Color(0xFF00A6A6),
+            modifier = Modifier.fillMaxWidth().height(120.dp)
+        )
+        Text("Замахи: ${metrics.size}", style = MaterialTheme.typography.titleSmall)
+        if (metrics.isEmpty()) {
+            Text("Полных замахов не найдено.", style = MaterialTheme.typography.bodySmall)
+        } else {
+            metrics.forEachIndexed { index, swing ->
+                val segment = swing.segment
+                Text(
+                    "${index + 1}. ${segment.durationMs} мс · пик скорости ${segment.peakSpeed?.let { "%.1f".format(it) } ?: "—"} торс/с · " +
+                        "колено ${formatMetric(swing.leadingKnee)} · " +
+                        "локоть ${formatMetric(swing.leadingElbow)} · корпус ${formatMetric(swing.trunkLean)}",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun MotionChart(
+    values: List<Float?>,
+    segments: List<com.tennisshadowcoach.analysis.SwingSegment>,
+    lowerThreshold: Float?,
+    upperThreshold: Float?,
+    lineColor: Color,
+    modifier: Modifier = Modifier
+) {
+    val present = values.filterNotNull() + listOfNotNull(lowerThreshold, upperThreshold)
+    if (present.isEmpty()) {
+        Text("Недостаточно данных для графика.", modifier = modifier, style = MaterialTheme.typography.bodySmall)
+        return
+    }
+    val minValue = present.minOrNull() ?: 0f
+    val maxValue = present.maxOrNull() ?: 1f
+    val span = (maxValue - minValue).takeIf { it > 1e-6f } ?: 1f
+    Canvas(modifier = modifier) {
+        fun x(index: Int): Float = if (values.size <= 1) 0f else index.toFloat() / (values.size - 1) * size.width
+        fun y(value: Float): Float = size.height - (value - minValue) / span * size.height
+        segments.forEach { segment ->
+            drawRect(
+                color = if (segment.truncated) Color(0x33FF9800) else Color(0x332196F3),
+                topLeft = androidx.compose.ui.geometry.Offset(x(segment.startFrame), 0f),
+                size = androidx.compose.ui.geometry.Size(x(segment.endFrame) - x(segment.startFrame), size.height)
+            )
+        }
+        listOfNotNull(lowerThreshold, upperThreshold).forEach { threshold ->
+            drawLine(Color(0xFFFF9800), androidx.compose.ui.geometry.Offset(0f, y(threshold)), androidx.compose.ui.geometry.Offset(size.width, y(threshold)), strokeWidth = 1.dp.toPx())
+        }
+        var previousIndex: Int? = null
+        values.forEachIndexed { index, value ->
+            if (value == null) previousIndex = null else {
+                previousIndex?.let { before ->
+                    val previous = values[before] ?: return@let
+                    drawLine(lineColor, androidx.compose.ui.geometry.Offset(x(before), y(previous)), androidx.compose.ui.geometry.Offset(x(index), y(value)), strokeWidth = 2.dp.toPx(), cap = StrokeCap.Round)
+                }
+                previousIndex = index
+            }
+        }
+    }
+}
+
+private fun formatAngle(value: Float?): String = value?.let { "%.0f°".format(it) } ?: "—"
+
+private fun formatMetric(metric: MetricSummary): String =
+    if (!metric.available) "недоступно для ракурса"
+    else if (metric.reliable) formatAngle(metric.atPeak)
+    else "ненадёжно (${(metric.validFrameFraction * 100).toInt()}%)"
 
 @Composable
 private fun FrameWithPoseOverlay(
