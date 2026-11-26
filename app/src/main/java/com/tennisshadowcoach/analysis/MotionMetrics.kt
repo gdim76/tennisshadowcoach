@@ -57,10 +57,26 @@ data class SwingSegment(
 
 data class SwingMetrics(
     val segment: SwingSegment,
-    val leftKneeAngle3d: Float?,
-    val rightKneeAngle3d: Float?,
-    val leadingElbowAngle3d: Float?,
-    val trunkLean3d: Float?
+    val leadingKnee: MetricSummary,
+    val leadingElbow: MetricSummary,
+    val trunkLean: MetricSummary
+) {
+    /** Names of metrics deliberately withheld because too few raw frames were valid. */
+    val unreliableMetricLabels: List<String>
+        get() = listOf(leadingKnee, leadingElbow, trunkLean)
+            .filter { it.available && !it.reliable }
+            .map { it.label }
+}
+
+/** Values are in degrees.  A value is omitted rather than guessed when raw evidence is weak. */
+data class MetricSummary(
+    val label: String,
+    val atPeak: Float?,
+    val min: Float?,
+    val max: Float?,
+    val validFrameFraction: Float,
+    val reliable: Boolean,
+    val available: Boolean
 )
 
 data class SwingDebugData(
@@ -107,17 +123,26 @@ object MotionMetricsEngine {
             )
         }
         val validFractions = MetricId.entries.associateWith { metric ->
-            frameMetrics.count { it.readings[metric]?.preferred != null }.toFloat() / frameMetrics.size
+            frames.indices.count { rawMetricIsValid(frames[it], metric, leadingHand, recordingAngle, config) }
+                .toFloat() / frames.size
         }
         val segmentation = segmentSwings(frames, leadingHand, wristSpeed, config)
         val swingMetrics = segmentation.complete.map { segment ->
-            val readings = segment.peakSpeedFrame?.let { frameMetrics.getOrNull(it)?.readings }
             SwingMetrics(
                 segment = segment,
-                leftKneeAngle3d = readings?.get(MetricId.LEFT_KNEE)?.world3d,
-                rightKneeAngle3d = readings?.get(MetricId.RIGHT_KNEE)?.world3d,
-                leadingElbowAngle3d = readings?.get(MetricId.LEADING_ELBOW)?.world3d,
-                trunkLean3d = readings?.get(MetricId.TRUNK_LEAN)?.world3d
+                leadingKnee = summarizeSwingMetric(
+                    frames, frameMetrics, segment,
+                    if (leadingHand == LeadingHand.RIGHT) MetricId.RIGHT_KNEE else MetricId.LEFT_KNEE,
+                    leadingHand, recordingAngle, config
+                ),
+                leadingElbow = summarizeSwingMetric(
+                    frames, frameMetrics, segment, MetricId.LEADING_ELBOW,
+                    leadingHand, recordingAngle, config
+                ),
+                trunkLean = summarizeSwingMetric(
+                    frames, frameMetrics, segment, MetricId.TRUNK_LEAN,
+                    leadingHand, recordingAngle, config
+                )
             )
         }
         return MotionAnalysis(
@@ -127,6 +152,66 @@ object MotionMetricsEngine {
             validFractions = validFractions,
             debug = SwingDebugData(segmentation.coordinate, wristSpeed, segmentation.lower, segmentation.upper, segmentation.all)
         )
+    }
+
+    private fun summarizeSwingMetric(
+        rawFrames: List<PoseFrame>,
+        smoothedFrames: List<FrameMetrics>,
+        segment: SwingSegment,
+        metric: MetricId,
+        hand: LeadingHand,
+        angle: RecordingAngle,
+        config: MetricsConfig
+    ): MetricSummary {
+        val available = metric.requiredAngle == null || metric.requiredAngle == angle
+        if (!available) return MetricSummary(
+            label = metric.label,
+            atPeak = null,
+            min = null,
+            max = null,
+            validFrameFraction = 0f,
+            reliable = false,
+            available = false
+        )
+        val range = segment.startFrame..segment.endFrame
+        val validFraction = range.count { index ->
+            rawMetricIsValid(rawFrames[index], metric, hand, angle, config)
+        }.toFloat() / range.count()
+        val reliable = validFraction >= config.reliableFrameFraction
+        val values = range.mapNotNull { index -> smoothedFrames[index].readings[metric]?.world3d }
+        val atPeak = segment.peakSpeedFrame?.let { smoothedFrames.getOrNull(it)?.readings?.get(metric)?.world3d }
+        return MetricSummary(
+            label = metric.label,
+            atPeak = atPeak.takeIf { reliable },
+            min = values.minOrNull().takeIf { reliable },
+            max = values.maxOrNull().takeIf { reliable },
+            validFrameFraction = validFraction,
+            reliable = reliable,
+            available = true
+        )
+    }
+
+    private fun rawMetricIsValid(
+        frame: PoseFrame,
+        metric: MetricId,
+        hand: LeadingHand,
+        angle: RecordingAngle,
+        config: MetricsConfig
+    ): Boolean {
+        val required = when (metric) {
+            MetricId.LEFT_KNEE -> listOf(23, 25, 27)
+            MetricId.RIGHT_KNEE -> listOf(24, 26, 28)
+            MetricId.LEADING_ELBOW -> if (hand == LeadingHand.RIGHT) listOf(12, 14, 16) else listOf(11, 13, 15)
+            MetricId.TRUNK_LEAN -> listOf(11, 12, 23, 24)
+            MetricId.SHOULDER_HIP_ROTATION -> listOf(11, 12, 23, 24)
+            MetricId.STANCE_WIDTH -> listOf(11, 12, 27, 28)
+            MetricId.WRIST_SPEED -> if (hand == LeadingHand.RIGHT) listOf(16, 23, 24, 11, 12) else listOf(15, 23, 24, 11, 12)
+        }
+        val angleAllowed = metric.requiredAngle == null || metric.requiredAngle == angle
+        return angleAllowed && required.all { landmark ->
+            frame.landmarks.getOrNull(landmark)?.visibility?.let { it >= config.visibilityThreshold } == true &&
+                frame.worldLandmarks.getOrNull(landmark) != null
+        }
     }
 
     private fun readingsFor(
@@ -175,7 +260,7 @@ object MotionMetricsEngine {
                 raw[index] = distance(now, before)!! / torso / dt
             }
         }
-        return smoothSeries(raw, config.speedSmoothingWindowFrames)
+        return savitzkyGolayWithGaps(raw, config.speedSmoothingWindowFrames)
     }
 
     private data class Segmentation(
@@ -193,7 +278,11 @@ object MotionMetricsEngine {
     ): Segmentation {
         val wrist = if (hand == LeadingHand.RIGHT) 16 else 15
         val torso = medianTorsoLength(frames.map { it.worldLandmarks }) ?: return Segmentation(emptyList(), emptyList(), List(frames.size) { null }, null, null)
-        val raw = frames.map { frame -> frame.worldLandmarks.getOrNull(wrist)?.toVec()?.div(torso) }
+        // MediaPipe world coordinates are hip-centred in the usual case; subtracting the
+        // measured hip midpoint also makes the invariant explicit for imported tracks.
+        val raw = frames.map { frame ->
+            relativeToHips(frame.worldLandmarks.getOrNull(wrist), frame.worldLandmarks)?.div(torso)
+        }
         val visible = frames.map { frame -> (frame.landmarks.getOrNull(wrist)?.visibility ?: 0f) >= config.visibilityThreshold }
         val points = cleanReferenceTrack(raw, visible, config)
         val coordinate = swingCoordinate(points, config)
@@ -268,15 +357,28 @@ object MotionMetricsEngine {
         }.transpose()
     }
 
+    /** Savitzky-Golay smoothing is applied per contiguous track; long gaps remain absent. */
     private fun smoothImageTracks(points: List<List<ImageLandmark?>>, window: Int): List<List<ImageLandmark?>> =
-        (0 until 33).map { landmark -> smoothSeries(points.map { it[landmark] }, window) { values ->
-            ImageLandmark(values.map { it.x }.average().toFloat(), values.map { it.y }.average().toFloat(), values.map { it.z }.average().toFloat(), values.mapNotNull { it.visibility }.average().toFloat())
-        } }.transpose()
+        (0 until 33).map { landmark ->
+            val x = savitzkyGolayWithGaps(points.map { it[landmark]?.x }, window)
+            val y = savitzkyGolayWithGaps(points.map { it[landmark]?.y }, window)
+            val z = savitzkyGolayWithGaps(points.map { it[landmark]?.z }, window)
+            points.indices.map { index ->
+                if (x[index] == null || y[index] == null || z[index] == null) null
+                else ImageLandmark(x[index]!!, y[index]!!, z[index]!!, points[index][landmark]?.visibility)
+            }
+        }.transpose()
 
     private fun smoothWorldTracks(points: List<List<WorldLandmark?>>, window: Int): List<List<WorldLandmark?>> =
-        (0 until 33).map { landmark -> smoothSeries(points.map { it[landmark] }, window) { values ->
-            WorldLandmark(values.map { it.x }.average().toFloat(), values.map { it.y }.average().toFloat(), values.map { it.z }.average().toFloat())
-        } }.transpose()
+        (0 until 33).map { landmark ->
+            val x = savitzkyGolayWithGaps(points.map { it[landmark]?.x }, window)
+            val y = savitzkyGolayWithGaps(points.map { it[landmark]?.y }, window)
+            val z = savitzkyGolayWithGaps(points.map { it[landmark]?.z }, window)
+            points.indices.map { index ->
+                if (x[index] == null || y[index] == null || z[index] == null) null
+                else WorldLandmark(x[index]!!, y[index]!!, z[index]!!)
+            }
+        }.transpose()
 
     private fun angle(a: ImageLandmark?, b: ImageLandmark?, c: ImageLandmark?) = angle(a?.toVec(), b?.toVec(), c?.toVec())
     private fun angle(a: WorldLandmark?, b: WorldLandmark?, c: WorldLandmark?) = angle(a?.toVec(), b?.toVec(), c?.toVec())
@@ -362,6 +464,21 @@ object MotionMetricsEngine {
             }
             polynomialAt(range.map { it - index to values[it] }, 2)
         }
+    }
+
+    private fun savitzkyGolayWithGaps(values: List<Float?>, window: Int): List<Float?> {
+        val output = MutableList<Float?>(values.size) { null }
+        var start = 0
+        while (start < values.size) {
+            while (start < values.size && values[start] == null) start++
+            if (start >= values.size) break
+            var end = start
+            while (end < values.size && values[end] != null) end++
+            val smoothed = savitzkyGolayReference(values.subList(start, end).map { it!! }, window)
+            smoothed.forEachIndexed { offset, value -> output[start + offset] = value }
+            start = end + 1
+        }
+        return output
     }
 
     private fun polynomialAt(samples: List<Pair<Int, Float>>, degree: Int): Float {

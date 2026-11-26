@@ -54,6 +54,7 @@ data class VideoAnalysis(
     val previewJpegs: List<ByteArray?>,
     val csvFile: File,
     val metadataFile: File,
+    val swingsCsvFile: File,
     val elapsedSeconds: Float,
     val processingFps: Float,
     val motion: MotionAnalysis
@@ -157,30 +158,34 @@ class VideoPoseAnalyzer(
             landmarker.close()
         }
 
+        val motion = MotionMetricsEngine.analyze(
+            frames = frames,
+            leadingHand = config.leadingHand,
+            recordingAngle = config.recordingAngle,
+            config = MetricsConfig(
+                visibilityThreshold = config.visibilityThreshold,
+                outlierMedianWindowFrames = config.outlierMedianWindowFrames,
+                outlierMedianDeviationTorsoLengths = config.outlierMedianDeviationTorsoLengths,
+                maxInterpolationGapFrames = config.maxInterpolationGapFrames,
+                speedSmoothingWindowFrames = config.speedSmoothingWindowFrames,
+                angleSmoothingWindowFrames = config.angleSmoothingWindowFrames,
+                swingCoordinateSmoothingWindowFrames = config.swingCoordinateSmoothingWindowFrames,
+                frontFrac = config.frontFrac,
+                backFrac = config.backFrac
+            )
+        )
+        val swingsCsvFile = File(csvFile.parentFile, "swings_${csvFile.nameWithoutExtension}.csv")
+        SwingCsvExporter.write(swingsCsvFile, motion, frames)
         val elapsedSeconds = (System.nanoTime() - startedAtNs) / NANOS_PER_SECOND
         return VideoAnalysis(
             frames = frames,
             previewJpegs = previewJpegs,
             csvFile = csvFile,
             metadataFile = exportFiles.metadataFile,
+            swingsCsvFile = swingsCsvFile,
             elapsedSeconds = elapsedSeconds,
             processingFps = if (elapsedSeconds == 0f) 0f else frames.size / elapsedSeconds,
-            motion = MotionMetricsEngine.analyze(
-                frames = frames,
-                leadingHand = config.leadingHand,
-                recordingAngle = config.recordingAngle,
-                config = MetricsConfig(
-                    visibilityThreshold = config.visibilityThreshold,
-                    outlierMedianWindowFrames = config.outlierMedianWindowFrames,
-                    outlierMedianDeviationTorsoLengths = config.outlierMedianDeviationTorsoLengths,
-                    maxInterpolationGapFrames = config.maxInterpolationGapFrames,
-                    speedSmoothingWindowFrames = config.speedSmoothingWindowFrames,
-                    angleSmoothingWindowFrames = config.angleSmoothingWindowFrames,
-                    swingCoordinateSmoothingWindowFrames = config.swingCoordinateSmoothingWindowFrames,
-                    frontFrac = config.frontFrac,
-                    backFrac = config.backFrac
-                )
-            )
+            motion = motion
         )
     }
 

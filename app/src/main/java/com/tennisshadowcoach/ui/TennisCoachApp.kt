@@ -240,7 +240,8 @@ fun TennisCoachApp() {
                 AnalysisResultCard(
                     analysis = result,
                     onOpenDebug = { showDebug = true },
-                    onShareCsv = { shareCsv(context, result.csvFile) }
+                    onShareCsv = { shareCsv(context, result.csvFile) },
+                    onShareSwingsCsv = { shareCsv(context, result.swingsCsvFile) }
                 )
             }
         }
@@ -251,7 +252,8 @@ fun TennisCoachApp() {
 private fun AnalysisResultCard(
     analysis: VideoAnalysis,
     onOpenDebug: () -> Unit,
-    onShareCsv: () -> Unit
+    onShareCsv: () -> Unit,
+    onShareSwingsCsv: () -> Unit
 ) {
     Card {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -267,7 +269,7 @@ private fun AnalysisResultCard(
                 )
             }
             Text(
-                "Сырые image и world-координаты 33 точек сохранены в CSV рядом с записью.",
+                "Сырые точки и отдельный CSV замахов с метриками сохранены рядом с записью.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -280,6 +282,11 @@ private fun AnalysisResultCard(
                 Icon(Icons.Default.FileDownload, contentDescription = null)
                 Spacer(Modifier.padding(horizontal = 4.dp))
                 Text("Экспортировать CSV")
+            }
+            Button(onClick = onShareSwingsCsv, modifier = Modifier.fillMaxWidth()) {
+                Icon(Icons.Default.FileDownload, contentDescription = null)
+                Spacer(Modifier.padding(horizontal = 4.dp))
+                Text("Экспортировать CSV замахов")
             }
         }
     }

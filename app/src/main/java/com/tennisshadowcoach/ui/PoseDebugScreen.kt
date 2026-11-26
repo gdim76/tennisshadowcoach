@@ -39,6 +39,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
 import com.tennisshadowcoach.analysis.SwingDebugData
 import com.tennisshadowcoach.analysis.SwingMetrics
+import com.tennisshadowcoach.analysis.MetricSummary
 import com.tennisshadowcoach.analysis.AnalysisConfig
 import com.tennisshadowcoach.analysis.ImageLandmark
 import com.tennisshadowcoach.analysis.VideoAnalysis
@@ -111,10 +112,16 @@ fun PoseDebugScreen(
             style = MaterialTheme.typography.bodySmall
         )
         analysis.motion.frames.getOrNull(selectedIndex)?.let { metrics ->
-            val values = metrics.readings.values.mapNotNull { reading -> reading.preferred }
+            val values = metrics.readings
+                .filterKeys { it != com.tennisshadowcoach.analysis.MetricId.WRIST_SPEED }
+                .mapNotNull { (metric, reading) ->
+                    val world = formatAngle(reading.world3d)
+                    val image = formatAngle(reading.image2d)
+                    if (world == "—" && image == "—") null else "${metric.label}: 3D $world, 2D $image"
+                }
             if (values.isNotEmpty()) {
                 Text(
-                    "Текущие 3D-значения: ${values.take(3).joinToString { "%.1f".format(it) }}",
+                    "Текущие значения: ${values.joinToString(" · ")}",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -179,8 +186,8 @@ private fun SwingCharts(debug: SwingDebugData, metrics: List<SwingMetrics>, modi
                 val segment = swing.segment
                 Text(
                     "${index + 1}. ${segment.durationMs} мс · пик скорости ${segment.peakSpeed?.let { "%.1f".format(it) } ?: "—"} торс/с · " +
-                        "колени ${formatAngle(swing.leftKneeAngle3d)}/${formatAngle(swing.rightKneeAngle3d)} · " +
-                        "локоть ${formatAngle(swing.leadingElbowAngle3d)} · корпус ${formatAngle(swing.trunkLean3d)}",
+                        "колено ${formatMetric(swing.leadingKnee)} · " +
+                        "локоть ${formatMetric(swing.leadingElbow)} · корпус ${formatMetric(swing.trunkLean)}",
                     style = MaterialTheme.typography.bodySmall
                 )
             }
@@ -232,6 +239,11 @@ private fun MotionChart(
 }
 
 private fun formatAngle(value: Float?): String = value?.let { "%.0f°".format(it) } ?: "—"
+
+private fun formatMetric(metric: MetricSummary): String =
+    if (!metric.available) "недоступно для ракурса"
+    else if (metric.reliable) formatAngle(metric.atPeak)
+    else "ненадёжно (${(metric.validFrameFraction * 100).toInt()}%)"
 
 @Composable
 private fun FrameWithPoseOverlay(
