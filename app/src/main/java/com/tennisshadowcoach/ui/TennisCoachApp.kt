@@ -50,6 +50,9 @@ import com.tennisshadowcoach.analysis.LeadingHand
 import com.tennisshadowcoach.analysis.RecordingAngle
 import com.tennisshadowcoach.analysis.VideoAnalysis
 import com.tennisshadowcoach.analysis.VideoPoseAnalyzer
+import com.tennisshadowcoach.coach.CoachSettingsStore
+import com.tennisshadowcoach.coach.FocusRuleEvaluator
+import com.tennisshadowcoach.coach.WeeklyFocus
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -68,9 +71,12 @@ fun TennisCoachApp() {
     var recordingNotice by remember { mutableStateOf<String?>(null) }
     var showCamera by remember { mutableStateOf(false) }
     var showDebug by remember { mutableStateOf(false) }
+    var showCoachSession by remember { mutableStateOf(false) }
     var leadingHand by remember { mutableStateOf(LeadingHand.RIGHT) }
     var recordingAngle by remember { mutableStateOf(RecordingAngle.SIDE) }
     val latestRecording = remember(context) { findLatestRecording(context) }
+    val coachStore = remember(context) { CoachSettingsStore(context) }
+    var coachDraft by remember { mutableStateOf(coachStore.load()) }
 
     val cameraPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -101,13 +107,22 @@ fun TennisCoachApp() {
         return
     }
 
+    if (showCoachSession) {
+        CoachSessionScreen(
+            draft = coachDraft,
+            onChange = { updated -> coachDraft = updated; coachStore.save(updated) },
+            onBack = { showCoachSession = false }
+        )
+        return
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
                 title = {
                     Column {
                         Text("Tennis Shadow Coach", fontWeight = FontWeight.Bold)
-                        Text("M0 · запись и сырые ландмарки", style = MaterialTheme.typography.labelSmall)
+                        Text("M2 · заметки и фокусы тренера", style = MaterialTheme.typography.labelSmall)
                     }
                 }
             )
@@ -131,6 +146,10 @@ fun TennisCoachApp() {
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
+            }
+
+            Button(onClick = { showCoachSession = true }, modifier = Modifier.fillMaxWidth()) {
+                Text("Открыть занятие и фокусы")
             }
 
             Card {
@@ -239,6 +258,7 @@ fun TennisCoachApp() {
             analysis?.let { result ->
                 AnalysisResultCard(
                     analysis = result,
+                    focuses = coachDraft.focuses.filter { it.active },
                     onOpenDebug = { showDebug = true },
                     onShareCsv = { shareCsv(context, result.csvFile) },
                     onShareSwingsCsv = { shareCsv(context, result.swingsCsvFile) }
@@ -251,6 +271,7 @@ fun TennisCoachApp() {
 @Composable
 private fun AnalysisResultCard(
     analysis: VideoAnalysis,
+    focuses: List<WeeklyFocus>,
     onOpenDebug: () -> Unit,
     onShareCsv: () -> Unit,
     onShareSwingsCsv: () -> Unit
@@ -267,6 +288,29 @@ private fun AnalysisResultCard(
                     "Замах ${index + 1}: ${swing.durationMs} мс · пик ${"%.2f".format(swing.peakSpeed)} торса/с",
                     style = MaterialTheme.typography.bodySmall
                 )
+            }
+            if (focuses.isNotEmpty()) {
+                Text("Фокусы тренера", style = MaterialTheme.typography.titleMedium)
+                focuses.forEach { focus ->
+                    Text(focus.title, fontWeight = FontWeight.SemiBold)
+                    val rule = focus.rule
+                    if (rule == null) {
+                        Text(
+                            "Задание для отработки — без числовой проверки.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    } else {
+                        FocusRuleEvaluator.evaluate(analysis.motion, rule).forEach { result ->
+                            val value = result.value?.let { " · ${"%.0f".format(it)}°" }.orEmpty()
+                            Text(
+                                "Замах ${result.swingNumber}: ${result.status.label}$value",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (result.status.name == "OUT_OF_RANGE") MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
             }
             Text(
                 "Сырые точки и отдельный CSV замахов с метриками сохранены рядом с записью.",

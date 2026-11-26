@@ -106,7 +106,9 @@ class MotionMetricsEngineTest {
         val dataDirectory = File("data").takeIf { it.isDirectory } ?: File("../data")
         assumeTrue("Local unlabelled CSV files are not present", dataDirectory.isDirectory)
         val knownNames = knownRecordings().map { it.csv.name }.toSet()
-        dataDirectory.listFiles { file -> file.extension == "csv" && file.name !in knownNames }.orEmpty().forEach { csv ->
+        dataDirectory.listFiles { file ->
+            file.extension == "csv" && file.name.startsWith("landmarks_") && file.name !in knownNames
+        }.orEmpty().forEach { csv ->
             val result = MotionMetricsEngine.analyze(CsvPoseFrames.read(csv), LeadingHand.RIGHT, RecordingAngle.SIDE)
             println("${csv.name}: ${result.swings.size} complete swings (manual count unknown)")
         }
