@@ -29,28 +29,16 @@ data class AnalysisConfig(
     val modelAssetPath: String = modelVariant.assetPath,
     val detectionConfidence: Float = 0.5f,
     val visibilityThreshold: Float = 0.5f,
-    val maxLandmarkJumpPerSecond: Float = 6f,
+    val outlierMedianWindowFrames: Int = 7,
+    val outlierMedianDeviationTorsoLengths: Float = 0.35f,
+    val maxInterpolationGapFrames: Int = 6,
     val speedSmoothingWindowFrames: Int = 5,
     val angleSmoothingWindowFrames: Int = 9,
+    val swingCoordinateSmoothingWindowFrames: Int = 9,
+    val frontFrac: Float = 0.6f,
+    val backFrac: Float = 0.25f,
     val leadingHand: LeadingHand = LeadingHand.RIGHT,
     val recordingAngle: RecordingAngle = RecordingAngle.SIDE
-)
-
-data class ImageLandmark(
-    val x: Float,
-    val y: Float,
-    val z: Float,
-    val visibility: Float?
-)
-
-data class WorldLandmark(val x: Float, val y: Float, val z: Float)
-
-/** One input video frame. A null landmark means that MediaPipe found no pose for it. */
-data class PoseFrame(
-    val index: Int,
-    val timestampUs: Long,
-    val landmarks: List<ImageLandmark?>,
-    val worldLandmarks: List<WorldLandmark?>
 )
 
 data class AnalysisProgress(
@@ -183,9 +171,14 @@ class VideoPoseAnalyzer(
                 recordingAngle = config.recordingAngle,
                 config = MetricsConfig(
                     visibilityThreshold = config.visibilityThreshold,
-                    maxLandmarkJumpPerSecond = config.maxLandmarkJumpPerSecond,
+                    outlierMedianWindowFrames = config.outlierMedianWindowFrames,
+                    outlierMedianDeviationTorsoLengths = config.outlierMedianDeviationTorsoLengths,
+                    maxInterpolationGapFrames = config.maxInterpolationGapFrames,
                     speedSmoothingWindowFrames = config.speedSmoothingWindowFrames,
-                    angleSmoothingWindowFrames = config.angleSmoothingWindowFrames
+                    angleSmoothingWindowFrames = config.angleSmoothingWindowFrames,
+                    swingCoordinateSmoothingWindowFrames = config.swingCoordinateSmoothingWindowFrames,
+                    frontFrac = config.frontFrac,
+                    backFrac = config.backFrac
                 )
             )
         )
@@ -310,11 +303,16 @@ private object AnalysisMetadataExporter {
               "pose_model": "${config.modelVariant.name.lowercase()}",
               "config": {
                 "visibility_threshold": ${config.visibilityThreshold},
-                "max_landmark_jump_per_second": ${config.maxLandmarkJumpPerSecond},
+                "outlier_median_window_frames": ${config.outlierMedianWindowFrames},
+                "outlier_median_deviation_torso_lengths": ${config.outlierMedianDeviationTorsoLengths},
+                "max_interpolation_gap_frames": ${config.maxInterpolationGapFrames},
                 "speed_smoothing_window_frames": ${config.speedSmoothingWindowFrames},
-                "angle_smoothing_window_frames": ${config.angleSmoothingWindowFrames}
-                ,"leading_hand": "${config.leadingHand.name.lowercase()}"
-                ,"recording_angle": "${config.recordingAngle.name.lowercase()}"
+                "angle_smoothing_window_frames": ${config.angleSmoothingWindowFrames},
+                "swing_coordinate_smoothing_window_frames": ${config.swingCoordinateSmoothingWindowFrames},
+                "front_frac": ${config.frontFrac},
+                "back_frac": ${config.backFrac},
+                "leading_hand": "${config.leadingHand.name.lowercase()}",
+                "recording_angle": "${config.recordingAngle.name.lowercase()}"
               }
             }
             """.trimIndent()
