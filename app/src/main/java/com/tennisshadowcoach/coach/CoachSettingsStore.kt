@@ -1,6 +1,7 @@
 package com.tennisshadowcoach.coach
 
 import android.content.Context
+import android.util.AtomicFile
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -8,10 +9,10 @@ import java.time.LocalDate
 
 /** Local-only editable JSON, intentionally small until a real session history is needed. */
 class CoachSettingsStore(context: Context) {
-    private val file = File(context.filesDir, "coach_session_draft.json")
+    private val file = AtomicFile(File(context.filesDir, "coach_session_draft.json"))
 
     fun load(): CoachSessionDraft = runCatching {
-        val root = JSONObject(file.readText())
+        val root = JSONObject(file.baseFile.readText())
         CoachSessionDraft(
             dateIso = root.optString("date", LocalDate.now().toString()),
             coachNote = root.optString("coach_note"),
@@ -20,13 +21,19 @@ class CoachSettingsStore(context: Context) {
     }.getOrElse { CoachSessionDraft(LocalDate.now().toString()) }
 
     fun save(draft: CoachSessionDraft) {
-        file.writeText(
-            JSONObject().apply {
-                put("date", draft.dateIso)
-                put("coach_note", draft.coachNote)
-                put("focuses", JSONArray().apply { draft.focuses.forEach { put(it.toJson()) } })
-            }.toString(2)
-        )
+        val contents = JSONObject().apply {
+            put("date", draft.dateIso)
+            put("coach_note", draft.coachNote)
+            put("focuses", JSONArray().apply { draft.focuses.forEach { put(it.toJson()) } })
+        }.toString(2)
+        val stream = file.startWrite()
+        try {
+            stream.write(contents.toByteArray(Charsets.UTF_8))
+            file.finishWrite(stream)
+        } catch (error: Throwable) {
+            file.failWrite(stream)
+            throw error
+        }
     }
 
     private fun JSONArray?.toFocuses(): List<WeeklyFocus> = buildList {

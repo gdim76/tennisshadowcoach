@@ -23,6 +23,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.key
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
@@ -63,11 +64,13 @@ fun CoachSessionScreen(
         )
         Text("Фокусы для отработки (${draft.focuses.size}/3)", style = MaterialTheme.typography.titleMedium)
         draft.focuses.forEach { focus ->
-            FocusEditor(
-                focus = focus,
-                onChange = { updated -> onChange(draft.copy(focuses = draft.focuses.map { if (it.id == focus.id) updated else it })) },
-                onRemove = { onChange(draft.copy(focuses = draft.focuses.filterNot { it.id == focus.id })) }
-            )
+            key(focus.id) {
+                FocusEditor(
+                    focus = focus,
+                    onChange = { updated -> onChange(draft.copy(focuses = draft.focuses.map { if (it.id == focus.id) updated else it })) },
+                    onRemove = { onChange(draft.copy(focuses = draft.focuses.filterNot { it.id == focus.id })) }
+                )
+            }
         }
         if (draft.focuses.size < 3) {
             Button(
