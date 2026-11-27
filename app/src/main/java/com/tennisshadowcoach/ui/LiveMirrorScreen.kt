@@ -1,5 +1,6 @@
 package com.tennisshadowcoach.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
@@ -15,6 +16,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
@@ -32,10 +34,12 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
@@ -54,9 +58,17 @@ fun LiveMirrorScreen(leadingHand: LeadingHand, onBack: () -> Unit) {
         LivePoseAnalyzer(context, leadingHand) { poseState = it }
     }
     DisposableEffect(analyzer) { onDispose { analyzer.close() } }
+    BackHandler { analyzer.finishSession(); onBack() }
+    // The phone stands 2.5–3 m away during practice: it must not lock while the mirror is open.
+    val view = LocalView.current
+    DisposableEffect(view) {
+        val wasKeepingScreenOn = view.keepScreenOn
+        view.keepScreenOn = true
+        onDispose { view.keepScreenOn = wasKeepingScreenOn }
+    }
 
     Column(
-        Modifier.fillMaxSize().padding(16.dp),
+        Modifier.fillMaxSize().systemBarsPadding().padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -70,7 +82,9 @@ fun LiveMirrorScreen(leadingHand: LeadingHand, onBack: () -> Unit) {
             }
         }
 
-        Box(Modifier.fillMaxWidth().height(500.dp)) {
+        // The preview takes the remaining height and clips the skeleton, so the counter and the
+        // calibration button always stay on screen (the column does not scroll).
+        Box(Modifier.fillMaxWidth().weight(1f).clipToBounds()) {
             LiveCameraPreview(analyzer, mirrored, Modifier.fillMaxSize())
             SkeletonOverlay(poseState, mirrored, Modifier.fillMaxSize())
         }
@@ -81,17 +95,16 @@ fun LiveMirrorScreen(leadingHand: LeadingHand, onBack: () -> Unit) {
             Text(if (mirrored) "Зеркальное превью включено" else "Зеркальное превью выключено")
         }
         Text("Обработка: ${"%.1f".format(poseState.framesPerSecond)} кадр/с · кадров: ${poseState.analysedFrames}")
-        Text("Счётчик замахов: ${poseState.swingCount}${if (!poseState.calibrated) " · выполни 2–3 замаха для калибровки" else ""}")
+        Text(
+            "Замахов: ${poseState.swingCount}",
+            style = MaterialTheme.typography.displaySmall
+        )
+        if (!poseState.calibrated) Text("Сделай 2–3 замаха и заверши калибровку.")
         Button(
             onClick = { analyzer.completeCalibration() },
             enabled = !poseState.calibrated && poseState.analysedFrames > 0,
             modifier = Modifier.fillMaxWidth()
         ) { Text("Завершить калибровку после 2–3 замахов") }
-        Text(
-            "Метка «П» показывает landmark 16 (правое запястье человека), «Л» — landmark 15. " +
-                "Зеркальность меняет только превью и отрисовку, не стороны модели.",
-            style = MaterialTheme.typography.bodySmall
-        )
         poseState.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
     }
 }

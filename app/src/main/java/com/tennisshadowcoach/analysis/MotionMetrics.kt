@@ -5,14 +5,54 @@ import kotlin.math.acos
 import kotlin.math.atan2
 import kotlin.math.sqrt
 
-enum class MetricId(val label: String, val requiredAngle: RecordingAngle?) {
-    LEFT_KNEE("Левое колено", RecordingAngle.SIDE),
-    RIGHT_KNEE("Правое колено", RecordingAngle.SIDE),
-    LEADING_ELBOW("Локоть ведущей руки", RecordingAngle.SIDE),
-    TRUNK_LEAN("Наклон корпуса (3D, от вертикали, без знака)", null),
-    SHOULDER_HIP_ROTATION("Разворот плеч относительно таза", RecordingAngle.FRONT_OR_45),
-    STANCE_WIDTH("Ширина стойки", RecordingAngle.FRONT_OR_45),
-    WRIST_SPEED("Скорость ведущего запястья", null)
+/**
+ * Every metric is computed for every recording.  The view the user films from is not chosen in
+ * the app; it is measured from the pose ([ViewEstimate]) and shown next to the numbers, so the
+ * accuracy of each metric per view can be checked instead of hiding metrics up front.
+ */
+enum class MetricId(val label: String) {
+    LEFT_KNEE("Левое колено"),
+    RIGHT_KNEE("Правое колено"),
+    LEADING_ELBOW("Локоть ведущей руки"),
+    TRUNK_LEAN("Наклон корпуса (3D, от вертикали, без знака)"),
+    SHOULDER_HIP_ROTATION("Разворот плеч относительно таза"),
+    STANCE_WIDTH("Ширина стойки"),
+    WRIST_SPEED("Скорость ведущего запястья")
+}
+
+/** Which body side faces the camera, by the depth of the shoulders. */
+enum class CameraSide(val wireValue: String, val label: String) {
+    LEADING("leading", "со стороны ведущей руки"),
+    TRAILING("trailing", "со стороны свободной руки"),
+    UNKNOWN("unknown", "не определено")
+}
+
+/** Coarse body orientation to the camera, measured at rest between swings. */
+enum class MeasuredView(val wireValue: String, val label: String) {
+    FACING("facing", "корпус к камере"),
+    HALF_TURNED("half_turned", "вполоборота"),
+    PROFILE("profile", "профиль"),
+    UNKNOWN("unknown", "не определено")
+}
+
+/**
+ * Measured, not declared.  Yaw is the angle of the hip line out of the image plane in MediaPipe
+ * world coordinates (0° = hips parallel to the image, 90° = profile), median over in-position
+ * frames between swings.  World depth is the noisiest MediaPipe axis, so the numbers are a
+ * diagnostic estimate; the category boundaries (20°/55°) are not validated against a reference.
+ */
+data class ViewEstimate(
+    val hipYawDegrees: Float?,
+    val shoulderYawDegrees: Float?,
+    /** Image shoulder width / image torso length in pixels; it shrinks towards a profile view. */
+    val imageShoulderWidthToTorso: Float?,
+    val cameraSide: CameraSide,
+    val view: MeasuredView,
+    val restFrames: Int
+) {
+    companion object {
+        val UNKNOWN = ViewEstimate(null, null, null, CameraSide.UNKNOWN, MeasuredView.UNKNOWN, 0)
+    }
 }
 
 data class MetricsConfig(
@@ -43,7 +83,16 @@ data class MetricsConfig(
      * this fraction of the median over candidate cycles.  Slowly raising the racket into the
      * ready position is a cycle of position, but not a swing.
      */
-    val minSwingSpeedFraction: Float = 0.3f
+    val minSwingSpeedFraction: Float = 0.3f,
+    /**
+     * Live counting: a swing is counted once the coordinate has fallen this fraction of the
+     * calibrated amplitude below its running peak, instead of waiting for the return to rest
+     * (median 1.0 s, up to 1.9 s after the peak).  With 0.05 the delay on the six reference
+     * recordings is median 0.10 s, at most 0.33 s; with 0.1 it was up to 0.6 s.  It must not
+     * exceed front_frac - back_frac (0.1 at the edge of the tested matrix), so every window
+     * reaches it before it closes.
+     */
+    val liveCountDropFraction: Float = 0.05f
 )
 
 data class MetricReading(
@@ -112,16 +161,21 @@ data class MotionAnalysis(
     val swings: List<SwingSegment>,
     val swingMetrics: List<SwingMetrics>,
     val validFractions: Map<MetricId, Float>,
-    val debug: SwingDebugData
+    val debug: SwingDebugData,
+    val view: ViewEstimate = ViewEstimate.UNKNOWN
 )
 
 /** Pure Kotlin M1 geometry. It never assigns a quality score to tennis technique. */
 object MotionMetricsEngine {
+    /**
+     * [imageAspect] is image height / width of the frames the model saw (portrait 1280×720 → 16/9);
+     * it only affects the image shoulder-width diagnostic.
+     */
     fun analyze(
         frames: List<PoseFrame>,
         leadingHand: LeadingHand,
-        recordingAngle: RecordingAngle,
-        config: MetricsConfig = MetricsConfig()
+        config: MetricsConfig = MetricsConfig(),
+        imageAspect: Float = 16f / 9f
     ): MotionAnalysis {
         if (frames.isEmpty()) return MotionAnalysis(
             emptyList(), emptyList(), emptyList(), emptyMap(),
@@ -139,11 +193,11 @@ object MotionMetricsEngine {
             FrameMetrics(
                 frameIndex = frames[index].index,
                 timestampUs = frames[index].timestampUs,
-                readings = readingsFor(image, world, wristSpeed[index], leadingHand, recordingAngle)
+                readings = readingsFor(image, world, wristSpeed[index], leadingHand)
             )
         }
         val validFractions = MetricId.entries.associateWith { metric ->
-            frames.indices.count { rawMetricIsValid(frames[it], metric, leadingHand, recordingAngle, config) }
+            frames.indices.count { rawMetricIsValid(frames[it], metric, leadingHand, config) }
                 .toFloat() / frames.size
         }
         val segmentation = segmentSwings(frames, leadingHand, config)
@@ -153,15 +207,15 @@ object MotionMetricsEngine {
                 leadingKnee = summarizeSwingMetric(
                     frames, frameMetrics, segment,
                     if (leadingHand == LeadingHand.RIGHT) MetricId.RIGHT_KNEE else MetricId.LEFT_KNEE,
-                    leadingHand, recordingAngle, config
+                    leadingHand, config
                 ),
                 leadingElbow = summarizeSwingMetric(
                     frames, frameMetrics, segment, MetricId.LEADING_ELBOW,
-                    leadingHand, recordingAngle, config
+                    leadingHand, config
                 ),
                 trunkLean = summarizeSwingMetric(
                     frames, frameMetrics, segment, MetricId.TRUNK_LEAN,
-                    leadingHand, recordingAngle, config
+                    leadingHand, config
                 )
             )
         }
@@ -170,8 +224,59 @@ object MotionMetricsEngine {
             swings = segmentation.complete,
             swingMetrics = swingMetrics,
             validFractions = validFractions,
-            debug = SwingDebugData(segmentation.coordinate, wristSpeed, segmentation.lower, segmentation.upper, segmentation.all)
+            debug = SwingDebugData(segmentation.coordinate, wristSpeed, segmentation.lower, segmentation.upper, segmentation.all),
+            view = estimateView(frames, segmentation.all, leadingHand, config, imageAspect)
         )
+    }
+
+    /** Median body orientation over in-position frames outside every swing window. */
+    internal fun estimateView(
+        frames: List<PoseFrame>,
+        windows: List<SwingSegment>,
+        hand: LeadingHand,
+        config: MetricsConfig,
+        imageAspect: Float
+    ): ViewEstimate {
+        val inPosition = inPositionMask(frames, config)
+        val rest = frames.indices.filter { index ->
+            inPosition[index] && windows.none { index in it.startFrame..it.endFrame }
+        }
+        if (rest.isEmpty()) return ViewEstimate.UNKNOWN
+        fun yaw(points: List<WorldLandmark?>, left: Int, right: Int): Float? {
+            val l = points.getOrNull(left) ?: return null
+            val r = points.getOrNull(right) ?: return null
+            val dx = abs(l.x - r.x); val dz = abs(l.z - r.z)
+            return if (dx + dz <= EPSILON) null else Math.toDegrees(atan2(dz, dx).toDouble()).toFloat()
+        }
+        val hipYaw = rest.mapNotNull { yaw(frames[it].worldLandmarks, 23, 24) }.takeIf { it.isNotEmpty() }?.median()
+        val shoulderYaw = rest.mapNotNull { yaw(frames[it].worldLandmarks, 11, 12) }.takeIf { it.isNotEmpty() }?.median()
+        val widthRatio = rest.mapNotNull { index ->
+            val p = frames[index].landmarks
+            val ls = p.getOrNull(11) ?: return@mapNotNull null; val rs = p.getOrNull(12) ?: return@mapNotNull null
+            val lh = p.getOrNull(23) ?: return@mapNotNull null; val rh = p.getOrNull(24) ?: return@mapNotNull null
+            fun px(dx: Float, dy: Float) = sqrt(dx * dx + dy * dy * imageAspect * imageAspect)
+            val torso = px((ls.x + rs.x - lh.x - rh.x) / 2f, (ls.y + rs.y - lh.y - rh.y) / 2f)
+            if (torso <= EPSILON) null else px(ls.x - rs.x, ls.y - rs.y) / torso
+        }.takeIf { it.isNotEmpty() }?.median()
+        // MediaPipe world z: smaller is closer to the camera.
+        val leadingCloser = rest.mapNotNull { index ->
+            val w = frames[index].worldLandmarks
+            val leading = w.getOrNull(if (hand == LeadingHand.RIGHT) 12 else 11) ?: return@mapNotNull null
+            val trailing = w.getOrNull(if (hand == LeadingHand.RIGHT) 11 else 12) ?: return@mapNotNull null
+            trailing.z - leading.z
+        }.takeIf { it.isNotEmpty() }?.median()
+        val side = when {
+            leadingCloser == null || abs(leadingCloser) < CAMERA_SIDE_MIN_DEPTH_METERS -> CameraSide.UNKNOWN
+            leadingCloser > 0f -> CameraSide.LEADING
+            else -> CameraSide.TRAILING
+        }
+        val view = when {
+            hipYaw == null -> MeasuredView.UNKNOWN
+            hipYaw < 20f -> MeasuredView.FACING
+            hipYaw < 55f -> MeasuredView.HALF_TURNED
+            else -> MeasuredView.PROFILE
+        }
+        return ViewEstimate(hipYaw, shoulderYaw, widthRatio, side, view, rest.size)
     }
 
     private fun summarizeSwingMetric(
@@ -180,23 +285,11 @@ object MotionMetricsEngine {
         segment: SwingSegment,
         metric: MetricId,
         hand: LeadingHand,
-        angle: RecordingAngle,
         config: MetricsConfig
     ): MetricSummary {
-        val available = metric.requiredAngle == null || metric.requiredAngle == angle
-        if (!available) return MetricSummary(
-            label = metric.label,
-            atImpact = null,
-            atCoordinatePeak = null,
-            min = null,
-            max = null,
-            validFrameFraction = 0f,
-            reliable = false,
-            available = false
-        )
         val range = segment.startFrame..segment.endFrame
         val validFraction = range.count { index ->
-            rawMetricIsValid(rawFrames[index], metric, hand, angle, config)
+            rawMetricIsValid(rawFrames[index], metric, hand, config)
         }.toFloat() / range.count()
         val reliable = validFraction >= config.reliableFrameFraction
         val values = range.mapNotNull { index -> smoothedFrames[index].readings[metric]?.world3d }
@@ -230,7 +323,6 @@ object MotionMetricsEngine {
         frame: PoseFrame,
         metric: MetricId,
         hand: LeadingHand,
-        angle: RecordingAngle,
         config: MetricsConfig
     ): Boolean {
         val required = when (metric) {
@@ -242,8 +334,7 @@ object MotionMetricsEngine {
             MetricId.STANCE_WIDTH -> listOf(11, 12, 27, 28)
             MetricId.WRIST_SPEED -> if (hand == LeadingHand.RIGHT) listOf(16, 23, 24, 11, 12) else listOf(15, 23, 24, 11, 12)
         }
-        val angleAllowed = metric.requiredAngle == null || metric.requiredAngle == angle
-        return angleAllowed && required.all { landmark ->
+        return required.all { landmark ->
             frame.landmarks.getOrNull(landmark)?.visibility?.let { it >= config.visibilityThreshold } == true &&
                 frame.worldLandmarks.getOrNull(landmark) != null
         }
@@ -253,28 +344,23 @@ object MotionMetricsEngine {
         image: List<ImageLandmark?>,
         world: List<WorldLandmark?>,
         wristSpeed: Float?,
-        hand: LeadingHand,
-        angle: RecordingAngle
+        hand: LeadingHand
     ): Map<MetricId, MetricReading> {
-        fun reading(worldValue: Float?, imageValue: Float?, allowed: Boolean) =
-            MetricReading(if (allowed) worldValue else null, if (allowed) imageValue else null)
+        fun reading(worldValue: Float?, imageValue: Float?) = MetricReading(worldValue, imageValue)
         val leadingShoulder = if (hand == LeadingHand.RIGHT) 12 else 11
         val leadingElbow = if (hand == LeadingHand.RIGHT) 14 else 13
         val leadingWrist = if (hand == LeadingHand.RIGHT) 16 else 15
-        val side = angle == RecordingAngle.SIDE
-        val front = angle == RecordingAngle.FRONT_OR_45
         return mapOf(
-            MetricId.LEFT_KNEE to reading(angle(world[23], world[25], world[27]), angle(image[23], image[25], image[27]), side),
-            MetricId.RIGHT_KNEE to reading(angle(world[24], world[26], world[28]), angle(image[24], image[26], image[28]), side),
+            MetricId.LEFT_KNEE to reading(angle(world[23], world[25], world[27]), angle(image[23], image[25], image[27])),
+            MetricId.RIGHT_KNEE to reading(angle(world[24], world[26], world[28]), angle(image[24], image[26], image[28])),
             MetricId.LEADING_ELBOW to reading(
                 angle(world[leadingShoulder], world[leadingElbow], world[leadingWrist]),
-                angle(image[leadingShoulder], image[leadingElbow], image[leadingWrist]),
-                side
+                angle(image[leadingShoulder], image[leadingElbow], image[leadingWrist])
             ),
             // The reported metric is world-3D.  The image-plane value is debug-only.
-            MetricId.TRUNK_LEAN to reading(worldTrunkLean(world), imageTrunkLean(image), true),
-            MetricId.SHOULDER_HIP_ROTATION to reading(shoulderHipRotation(world), null, front),
-            MetricId.STANCE_WIDTH to reading(worldStanceWidth(world), imageStanceWidth(image), front),
+            MetricId.TRUNK_LEAN to reading(worldTrunkLean(world), imageTrunkLean(image)),
+            MetricId.SHOULDER_HIP_ROTATION to reading(shoulderHipRotation(world), null),
+            MetricId.STANCE_WIDTH to reading(worldStanceWidth(world), imageStanceWidth(image)),
             MetricId.WRIST_SPEED to MetricReading(wristSpeed, null)
         )
     }
@@ -741,6 +827,8 @@ object MotionMetricsEngine {
     private fun Float.pow(power: Int): Float { var result = 1f; repeat(power) { result *= this }; return result }
     private const val EPSILON = 1e-6f
     private const val SIDE_ALIGNMENT_MIN = 0.3f
+    /** Shoulder depth difference below which the camera side is reported as unknown. */
+    private const val CAMERA_SIDE_MIN_DEPTH_METERS = 0.03f
 }
 
 private fun <T> interpolate(values: List<T?>, maxGap: Int, blend: (T,T,Float)->T): List<T?> {

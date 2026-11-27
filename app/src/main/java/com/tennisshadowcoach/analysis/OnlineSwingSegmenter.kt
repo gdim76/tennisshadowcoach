@@ -5,6 +5,10 @@ package com.tennisshadowcoach.analysis
  * The first two or three deliberately performed swings are retained for calibration; after
  * [completeCalibration] the same hysteresis used offline runs frame by frame.  It has no
  * Android dependency and deliberately produces counts only, never coaching prompts.
+ *
+ * Two things are tracked: [detectedSwings] are the closed windows (identical to offline), and
+ * the live count, which increases as soon as the coordinate turns down after the peak — about
+ * the follow-through — instead of when the arm is back at rest up to two seconds later.
  */
 class OnlineSwingSegmenter(
     private val config: MetricsConfig = MetricsConfig()
@@ -38,6 +42,12 @@ class OnlineSwingSegmenter(
     private var lastValidIndex = -1
     /** Median rise speed of the calibration swings; the reference for the slow-movement rule. */
     private var referenceSpeed: Float? = null
+    private var amplitude = 0f
+    /** Swings shown to the user; normally equal to the closed windows plus a counted open one. */
+    private var liveCount = 0
+    /** The open window has already been counted at its turn after the peak. */
+    private var openCounted = false
+    private var openChecked = false
 
     /** Call after the user has completed two or three calibration swings. */
     fun completeCalibration(): Update {
@@ -48,6 +58,7 @@ class OnlineSwingSegmenter(
         require(hi - lo > EPSILON) { "Для калибровки нужны движения с заметным размахом." }
         lower = lo + config.backFrac * (hi - lo)
         upper = lo + config.frontFrac * (hi - lo)
+        amplitude = hi - lo
         calibrated = true
         resetDetector()
         samples.indices.forEach { index ->
@@ -61,7 +72,9 @@ class OnlineSwingSegmenter(
             if (speeds.size % 2 == 0) (speeds[speeds.size / 2 - 1] + speeds[speeds.size / 2]) / 2f else speeds[speeds.size / 2]
         }
         detected.retainAll { !isTooSlow(it) }
-        return Update(true, detected.size)
+        openCounted = state == SWING && openCounted && !isTooSlow(candidate(start, peak, samples.lastIndex))
+        liveCount = detected.size + if (openCounted) 1 else 0
+        return Update(true, liveCount)
     }
 
     fun add(frame: Int, timestampUs: Long, coordinate: Float?): Update {
@@ -70,11 +83,11 @@ class OnlineSwingSegmenter(
             if (firstValidIndex < 0) firstValidIndex = samples.lastIndex
             lastValidIndex = samples.lastIndex
         }
-        if (!calibrated) return Update(false, detected.size)
+        if (!calibrated) return Update(false, 0)
         heldCoordinates += coordinate ?: lastHeld
         lastHeld = heldCoordinates.last()
-        val completed = process(samples.lastIndex)
-        return Update(true, detected.size, completed)
+        val counted = process(samples.lastIndex)
+        return Update(true, liveCount, counted)
     }
 
     fun detectedSwings(): List<DetectedSwing> = detected.toList()
@@ -84,22 +97,30 @@ class OnlineSwingSegmenter(
      * window is countable only when its peak is at least 0.3 seconds before the final frame.
      */
     fun finish(): Update {
-        if (!calibrated || state != SWING || samples.isEmpty()) return Update(calibrated, detected.size)
+        if (!calibrated || state != SWING || samples.isEmpty()) return Update(calibrated, liveCount)
         // Trailing setup frames (walking to the phone) carry no coordinate; the recording
         // effectively ends at the last frame that has one, as offline.
         val endIndex = lastValidIndex.takeIf { it >= 0 } ?: samples.lastIndex
         val peakAgeSeconds = (samples[endIndex].timestampUs - samples[peak].timestampUs) / 1_000_000f
-        if (peakAgeSeconds < config.trailingPeakExclusionSeconds) return Update(true, detected.size)
         state = REST
         val durationSeconds = (samples[endIndex].timestampUs - samples[start].timestampUs) / 1_000_000f
-        val completed = if (durationSeconds >= config.minSwingDurationSeconds && start > firstValidIndex) {
-            candidate(start, peak, endIndex).takeUnless(::isTooSlow)?.also(detected::add)
-        } else null
-        return Update(true, detected.size, completed)
+        val countable = peakAgeSeconds >= config.trailingPeakExclusionSeconds &&
+            durationSeconds >= config.minSwingDurationSeconds && start > firstValidIndex
+        val window = candidate(start, peak, endIndex).takeIf { countable && !isTooSlow(it) }
+        // Offline rules decide at the end: a swing counted live but cut by the end of the
+        // session is withdrawn, an uncounted complete one is added.
+        if (openCounted && window == null) liveCount--
+        if (!openCounted && window != null) liveCount++
+        window?.let(detected::add)
+        openCounted = false
+        return Update(true, liveCount, window)
     }
 
     private fun resetDetector() {
         detected.clear()
+        liveCount = 0
+        openCounted = false
+        openChecked = false
         state = REST
         start = 0
         peak = 0
@@ -116,6 +137,8 @@ class OnlineSwingSegmenter(
                 start = foundStart
                 peak = index
                 state = SWING
+                openCounted = false
+                openChecked = false
             }
             return null
         }
@@ -124,10 +147,28 @@ class OnlineSwingSegmenter(
             state = REST
             val durationSeconds = (samples[index].timestampUs - samples[start].timestampUs) / 1_000_000f
             // A rise that began before the first usable frame was not seen: like offline, skip it.
-            if (durationSeconds >= config.minSwingDurationSeconds && start > firstValidIndex) {
-                // During the calibration replay there is no reference yet, so nothing is "too slow";
-                // completeCalibration() filters those candidates once the reference exists.
-                return candidate(start, peak, index).takeUnless(::isTooSlow)?.also(detected::add)
+            // During the calibration replay there is no reference yet, so nothing is "too slow";
+            // completeCalibration() filters those candidates once the reference exists.
+            val window = candidate(start, peak, index).takeIf {
+                durationSeconds >= config.minSwingDurationSeconds && start > firstValidIndex && !isTooSlow(it)
+            }
+            window?.let(detected::add)
+            val newlyCounted = window != null && !openCounted
+            if (newlyCounted) liveCount++
+            if (window == null && openCounted) liveCount--
+            openCounted = false
+            return window.takeIf { newlyCounted }
+        }
+        // Count at the turn after the peak (follow-through), once per window.
+        if (!openChecked && value < heldCoordinates[peak] - config.liveCountDropFraction * amplitude) {
+            openChecked = true
+            if (start > firstValidIndex) {
+                val swing = candidate(start, peak, index)
+                if (!isTooSlow(swing)) {
+                    openCounted = true
+                    liveCount++
+                    return swing
+                }
             }
         }
         return null

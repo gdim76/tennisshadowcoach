@@ -89,7 +89,7 @@ fun CameraRecordScreen(
             Column(Modifier.weight(1f)) {
                 Text("Запись упражнения", style = MaterialTheme.typography.titleLarge)
                 Text(
-                    "Сначала явно укажи условия записи. Целевой режим — 30 кадров/с.",
+                    "Выбери камеру и ведущую руку. Ракурс определится по позе. Целевой режим — 30 кадров/с.",
                     style = MaterialTheme.typography.bodySmall
                 )
             }
@@ -111,7 +111,7 @@ fun CameraRecordScreen(
 
         Button(
             modifier = Modifier.fillMaxWidth(),
-            enabled = videoCapture != null && lensFacing != null,
+            enabled = videoCapture != null && lensFacing != null && metadata.leadingHand != null,
             onClick = {
                 val capture = videoCapture ?: return@Button
                 if (recordingNow) {

@@ -7,9 +7,15 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -19,50 +25,68 @@ import com.tennisshadowcoach.analysis.LeadingHand
 import com.tennisshadowcoach.analysis.PhoneSide
 import com.tennisshadowcoach.analysis.RecordingMetadata
 
-/** Shared editor used before capture and before analysing an existing recording. */
+/**
+ * Shared editor used before capture and before analysing an existing recording.  Only the camera
+ * and the leading hand are asked for; the view is measured from the pose.  The diagnostic block
+ * lets the owner record the true view and manual counts so the measurements can be checked.
+ */
 @Composable
 fun RecordingMetadataEditor(
     value: RecordingMetadata,
     onChange: (RecordingMetadata) -> Unit,
     cameraSelectable: Boolean = true
 ) {
+    var diagnosticsOpen by rememberSaveable { mutableStateOf(false) }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (cameraSelectable) {
-            MetadataChips("Камера", CaptureCamera.entries, value.camera, { it.label }) {
+            MetadataChips("Камера", listOf(CaptureCamera.SELFIE, CaptureCamera.REAR), value.camera, { it.label }) {
                 onChange(value.copy(camera = it))
             }
         }
-        MetadataChips("Ракурс", CaptureRecordingAngle.entries, value.recordingAngle, { it.label }) {
-            onChange(value.copy(recordingAngle = it))
-        }
-        MetadataChips("Телефон относительно человека", PhoneSide.entries, value.phoneSide, { it.label }) {
-            onChange(value.copy(phoneSide = it))
-        }
-        MetadataChips("Ведущая рука", listOf<LeadingHand?>(null, LeadingHand.RIGHT, LeadingHand.LEFT), value.leadingHand, {
-            when (it) { LeadingHand.RIGHT -> "Правая"; LeadingHand.LEFT -> "Левая"; null -> "Не выбрано" }
+        MetadataChips("Ведущая рука", listOf<LeadingHand?>(LeadingHand.RIGHT, LeadingHand.LEFT), value.leadingHand, {
+            when (it) { LeadingHand.RIGHT -> "Правая"; LeadingHand.LEFT -> "Левая"; null -> "" }
         }) {
             onChange(value.copy(leadingHand = it))
         }
-        Text("Ручной счёт (необязательно): отдельно с паузами и серия подряд")
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-            OutlinedTextField(
-                value = value.manualPausedSwings?.toString().orEmpty(),
-                onValueChange = { onChange(value.copy(manualPausedSwings = it.toIntOrNull())) },
-                label = { Text("С паузами") },
-                singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                modifier = Modifier.weight(1f)
-            )
-            OutlinedTextField(
-                value = value.manualSeriesSwings?.toString().orEmpty(),
-                onValueChange = { onChange(value.copy(manualSeriesSwings = it.toIntOrNull())) },
-                label = { Text("Серия") },
-                singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                modifier = Modifier.weight(1f)
-            )
+        Text(
+            "Ракурс выбирать не нужно: поворот тела к камере приложение измерит само.",
+            style = MaterialTheme.typography.bodySmall
+        )
+        TextButton(onClick = { diagnosticsOpen = !diagnosticsOpen }) {
+            Text(if (diagnosticsOpen) "Скрыть поля для диагностики" else "Для диагностики (необязательно)")
         }
-        value.expectedSwings?.let { Text("В metadata будет expected_swings: $it") }
+        if (diagnosticsOpen) {
+            Text(
+                "Эти поля нужны только для проверки автоматики: как стоял телефон на самом деле и сколько было замахов.",
+                style = MaterialTheme.typography.bodySmall
+            )
+            MetadataChips("Ракурс на самом деле", CaptureRecordingAngle.entries, value.recordingAngle, { it.label }) {
+                onChange(value.copy(recordingAngle = it))
+            }
+            MetadataChips("Телефон относительно человека", PhoneSide.entries, value.phoneSide, { it.label }) {
+                onChange(value.copy(phoneSide = it))
+            }
+            Text("Ручной счёт: отдельно с паузами и серия подряд")
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                OutlinedTextField(
+                    value = value.manualPausedSwings?.toString().orEmpty(),
+                    onValueChange = { onChange(value.copy(manualPausedSwings = it.toIntOrNull())) },
+                    label = { Text("С паузами") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.weight(1f)
+                )
+                OutlinedTextField(
+                    value = value.manualSeriesSwings?.toString().orEmpty(),
+                    onValueChange = { onChange(value.copy(manualSeriesSwings = it.toIntOrNull())) },
+                    label = { Text("Серия") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.weight(1f)
+                )
+            }
+            value.expectedSwings?.let { Text("В metadata будет expected_swings: $it") }
+        }
     }
 }
 

@@ -12,7 +12,7 @@ class MotionMetricsEngineTest {
     @Test fun `computes 3d knee angle from synthetic landmarks`() {
         val pose = frame(0, wristX = 0f).withWorld(23, WorldLandmark(0f, 1f, 0f))
             .withWorld(25, WorldLandmark(0f, 0f, 0f)).withWorld(27, WorldLandmark(1f, 0f, 0f))
-        val result = MotionMetricsEngine.analyze(List(9) { pose.copy(index = it, timestampUs = it * 33_333L) }, LeadingHand.RIGHT, RecordingAngle.SIDE)
+        val result = MotionMetricsEngine.analyze(List(9) { pose.copy(index = it, timestampUs = it * 33_333L) }, LeadingHand.RIGHT)
         assertEquals(90f, result.frames[4].readings.getValue(MetricId.LEFT_KNEE).world3d!!, 0.1f)
     }
 
@@ -24,8 +24,7 @@ class MotionMetricsEngineTest {
             .withWorld(24, WorldLandmark(.5f, 0f, 0f))
         val result = MotionMetricsEngine.analyze(
             List(9) { pose.copy(index = it, timestampUs = it * 33_333L) },
-            LeadingHand.RIGHT,
-            RecordingAngle.SIDE
+            LeadingHand.RIGHT
         )
         assertEquals(45f, result.frames[4].readings.getValue(MetricId.TRUNK_LEAN).world3d!!, .1f)
     }
@@ -33,7 +32,7 @@ class MotionMetricsEngineTest {
     @Test fun `masks a one-frame median outlier instead of limiting true speed`() {
         val positions = List(25) { if (it == 12) 8f else it / 24f }
         val analysis = MotionMetricsEngine.analyze(
-            positions.mapIndexed(::frame), LeadingHand.RIGHT, RecordingAngle.SIDE,
+            positions.mapIndexed(::frame), LeadingHand.RIGHT,
             MetricsConfig(outlierMedianDeviationTorsoLengths = .35f)
         )
         assertNotNull(analysis.frames[11].readings[MetricId.WRIST_SPEED]?.world3d)
@@ -75,7 +74,7 @@ class MotionMetricsEngineTest {
                 for (back in listOf(.15f, .2f, .25f, .3f)) {
                     for (window in listOf(5, 9, 17)) {
                         val analysis = MotionMetricsEngine.analyze(
-                            frames, recording.leadingHand, recording.recordingAngle,
+                            frames, recording.leadingHand,
                             MetricsConfig(frontFrac = front, backFrac = back, swingCoordinateSmoothingWindowFrames = window)
                         )
                         if (analysis.swings.size != recording.expectedSwings) {
@@ -102,9 +101,10 @@ class MotionMetricsEngineTest {
             (calibrationEnd + 1..frames.lastIndex).forEach { index ->
                 online.add(frames[index].index, frames[index].timestampUs, offline.debug.coordinate[index])
             }
-            online.finish()
+            val final = online.finish()
             println("${recording.name}: offline=${offline.swings.map { it.startFrame to it.endFrame }}, online=${online.detectedSwings().map { it.startFrame to it.endFrame }}")
             assertEquals("online replay ${recording.name}", offline.swings.size, online.detectedSwings().size)
+            assertEquals("online live count ${recording.name}", offline.swings.size, final.completedCount)
         }
     }
 
@@ -138,7 +138,7 @@ class MotionMetricsEngineTest {
             val frames = CsvPoseFrames.read(recording.csv)
             for (tolerance in listOf(.2f, .25f, .3f, .4f)) for (run in listOf(.5f, 1f, 2f)) for (speed in listOf(.2f, .3f, .4f)) {
                 val count = MotionMetricsEngine.analyze(
-                    frames, recording.leadingHand, recording.recordingAngle,
+                    frames, recording.leadingHand,
                     MetricsConfig(inPositionTorsoTolerance = tolerance, minInPositionSeconds = run, minSwingSpeedFraction = speed)
                 ).swings.size
                 if (count != recording.expectedSwings) {
@@ -159,17 +159,70 @@ class MotionMetricsEngineTest {
         assertTrue(defaults.debug.allSegments.none { seconds(it.peakFrame) < 3f })
         // Raising the racket into the ready position (~6 s) crosses a low front threshold,
         // but is far slower than the swings, so it is recorded and not counted.
-        val lowFront = MotionMetricsEngine.analyze(frames, recording.leadingHand, recording.recordingAngle, MetricsConfig(frontFrac = .4f))
+        val lowFront = MotionMetricsEngine.analyze(frames, recording.leadingHand, MetricsConfig(frontFrac = .4f))
         val raise = lowFront.debug.allSegments.single { seconds(it.peakFrame) in 5f..7f }
         assertTrue(raise.tooSlow)
         assertFalse(raise.counted)
         assertEquals(recording.expectedSwings, lowFront.swings.size)
     }
 
+    @Test fun `every metric is computed regardless of the declared view`() {
+        knownRecordings().forEach { recording ->
+            val analysis = analyze(recording)
+            val knees = analysis.swingMetrics.map { it.leadingKnee }
+            assertTrue(recording.name, knees.all { it.available })
+            assertTrue("${recording.name}: knee at impact measured", knees.count { it.atImpact != null } >= recording.expectedSwings / 2)
+            assertTrue(recording.name, analysis.frames.any { it.readings[MetricId.SHOULDER_HIP_ROTATION]?.world3d != null })
+            assertTrue(recording.name, analysis.frames.any { it.readings[MetricId.STANCE_WIDTH]?.world3d != null })
+        }
+    }
+
+    @Test fun `view is measured for every labelled recording`() {
+        knownRecordings().forEach { recording ->
+            val view = analyze(recording).view
+            println("${recording.name}: declared ${recording.declaredAngle}/${recording.phoneSide}, measured ${view.view} " +
+                "hipYaw=${view.hipYawDegrees} shoulderYaw=${view.shoulderYawDegrees} width=${view.imageShoulderWidthToTorso} side=${view.cameraSide} rest=${view.restFrames}")
+            assertTrue(recording.name, view.restFrames > 30)
+            assertNotNull(recording.name, view.hipYawDegrees)
+            // The only recording with a declared phone side: right of a right-hander.
+            if (recording.phoneSide == "right" && recording.leadingHand == LeadingHand.RIGHT) {
+                assertEquals(recording.name, CameraSide.LEADING, view.cameraSide)
+            }
+        }
+    }
+
+    @Test fun `live counter counts within about 0 point 3 s of the coordinate peak`() {
+        val delays = mutableListOf<Float>()
+        knownRecordings().forEach { recording ->
+            val frames = CsvPoseFrames.read(recording.csv)
+            val offline = analyze(recording)
+            val calibrationEnd = offline.swings[2].endFrame
+            val tracker = OnlineLiveSwingTracker(recording.leadingHand)
+            (0..calibrationEnd).forEach { tracker.add(frames[it].index, frames[it].timestampUs, frames[it].landmarks, frames[it].worldLandmarks) }
+            var count = tracker.completeCalibration().completedCount
+            val perClip = mutableListOf<Float>()
+            (calibrationEnd + 1..frames.lastIndex).forEach { index ->
+                val state = tracker.add(frames[index].index, frames[index].timestampUs, frames[index].landmarks, frames[index].worldLandmarks)
+                if (state.completedCount > count) {
+                    count = state.completedCount
+                    val window = offline.swings.minBy { maxOf(it.startFrame - index, index - it.endFrame, 0) + kotlin.math.abs(index - it.peakFrame) / 1000 }
+                    perClip += (frames[index].timestampUs - frames[window.peakFrame].timestampUs) / 1_000_000f
+                }
+            }
+            println("LATENCY ${recording.name}: ${perClip.joinToString { "%.2f".format(it) }}")
+            delays += perClip
+        }
+        val median = delays.sorted()[delays.size / 2]
+        println("LATENCY all: min=${"%.2f".format(delays.min())} median=${"%.2f".format(median)} max=${"%.2f".format(delays.max())}")
+        // SPEC M3: a swing is counted no later than ~0.3 s after the coordinate peak
+        // ("~": one frame of tolerance at 30 fps).
+        assertTrue("max latency ${delays.max()} s", delays.max() <= .35f)
+    }
+
     @Test fun `impact is 0 point 1 to 0 point 45 seconds before coordinate peak for all labelled swings`() {
         knownRecordings().forEach { recording ->
             val frames = CsvPoseFrames.read(recording.csv)
-            val analysis = MotionMetricsEngine.analyze(frames, recording.leadingHand, recording.recordingAngle)
+            val analysis = MotionMetricsEngine.analyze(frames, recording.leadingHand)
             assertEquals(recording.name, recording.expectedSwings, analysis.swings.size)
             analysis.swings.forEachIndexed { index, swing ->
                 val impact = requireNotNull(swing.impactFrame) { "${recording.name} swing ${index + 1}: impact missing" }
@@ -186,7 +239,7 @@ class MotionMetricsEngineTest {
     @Test fun `legacy wrist magnitude peak violates impact timing on the 8 swing recording`() {
         val recording = knownRecordings().first()
         val frames = CsvPoseFrames.read(recording.csv)
-        val analysis = MotionMetricsEngine.analyze(frames, LeadingHand.RIGHT, RecordingAngle.SIDE)
+        val analysis = MotionMetricsEngine.analyze(frames, LeadingHand.RIGHT)
         val badLegacyTimings = analysis.swings.count { swing ->
             val legacyFrame = (swing.startFrame..swing.endFrame)
                 .filter { analysis.debug.wristSpeed[it] != null }
@@ -217,7 +270,7 @@ class MotionMetricsEngineTest {
             image[24] = image[24]?.copy(visibility = .1f)
             frame.copy(landmarks = image)
         }
-        val analysis = MotionMetricsEngine.analyze(frames, LeadingHand.RIGHT, RecordingAngle.SIDE)
+        val analysis = MotionMetricsEngine.analyze(frames, LeadingHand.RIGHT)
         assertFalse(analysis.swingMetrics.isEmpty())
         analysis.swingMetrics.forEach { swing ->
             assertFalse(swing.leadingKnee.reliable)
@@ -229,7 +282,7 @@ class MotionMetricsEngineTest {
         val outputDirectory = File("build/m1-exports")
         knownRecordings().forEach { recording ->
             val frames = CsvPoseFrames.read(recording.csv)
-            val analysis = MotionMetricsEngine.analyze(frames, recording.leadingHand, recording.recordingAngle)
+            val analysis = MotionMetricsEngine.analyze(frames, recording.leadingHand)
             val output = File(outputDirectory, "swings_${recording.csv.name}")
             SwingCsvExporter.write(output, analysis, frames)
             val lines = output.readLines()
@@ -245,7 +298,7 @@ class MotionMetricsEngineTest {
         dataDirectory.listFiles { file ->
             file.extension == "csv" && file.name.startsWith("landmarks_") && file.name !in knownNames
         }.orEmpty().forEach { csv ->
-            val result = MotionMetricsEngine.analyze(CsvPoseFrames.read(csv), LeadingHand.RIGHT, RecordingAngle.SIDE)
+            val result = MotionMetricsEngine.analyze(CsvPoseFrames.read(csv), LeadingHand.RIGHT)
             println("${csv.name}: ${result.swings.size} complete swings (manual count unknown)")
         }
     }
@@ -253,8 +306,7 @@ class MotionMetricsEngineTest {
     private fun analyze(recording: KnownRecording): MotionAnalysis =
         MotionMetricsEngine.analyze(
             CsvPoseFrames.read(recording.csv),
-            recording.leadingHand,
-            recording.recordingAngle
+            recording.leadingHand
         )
 
     /** Every resource with expected_swings automatically joins the regression matrix. */
@@ -272,12 +324,9 @@ class MotionMetricsEngineTest {
                 val csv = File(directory, metadata.name.removeSuffix(".metadata.json") + ".csv")
                 require(csv.isFile) { "Metadata ${metadata.name} has expected_swings but no CSV" }
                 val hand = if (metadataText.contains("\"leading_hand\"\\s*:\\s*\"left\"".toRegex())) LeadingHand.LEFT else LeadingHand.RIGHT
-                val angle = if (metadataText.contains("\"recording_angle\"\\s*:\\s*\"side\"".toRegex())) {
-                    RecordingAngle.SIDE
-                } else {
-                    RecordingAngle.FRONT_OR_45
-                }
-                KnownRecording(csv.name, csv, expected, hand, angle)
+                val declaredAngle = DECLARED_ANGLE.find(metadataText)?.groupValues?.get(1) ?: "unspecified"
+                val phoneSide = PHONE_SIDE.find(metadataText)?.groupValues?.get(1) ?: "unspecified"
+                KnownRecording(csv.name, csv, expected, hand, declaredAngle, phoneSide)
             }
         }
             .sortedBy { it.name }
@@ -328,7 +377,9 @@ class MotionMetricsEngineTest {
         val csv: File,
         val expectedSwings: Int,
         val leadingHand: LeadingHand,
-        val recordingAngle: RecordingAngle
+        /** What the owner declared for diagnostics; the analysis itself never reads it. */
+        val declaredAngle: String,
+        val phoneSide: String
     )
     private data class LegacyVec(val x: Float, val y: Float, val z: Float) {
         fun distanceTo(other: LegacyVec): Float = kotlin.math.sqrt(
@@ -338,6 +389,8 @@ class MotionMetricsEngineTest {
 
     private companion object {
         val EXPECTED_SWINGS = Regex("\\\"expected_swings\\\"\\s*:\\s*(\\d+)")
+        val DECLARED_ANGLE = Regex("\"recording_angle\"\\s*:\\s*\"([a-z_0-9]+)\"")
+        val PHONE_SIDE = Regex("\"phone_side\"\\s*:\\s*\"([a-z_]+)\"")
     }
 }
 
