@@ -9,7 +9,13 @@ package com.tennisshadowcoach.analysis
 class OnlineSwingSegmenter(
     private val config: MetricsConfig = MetricsConfig()
 ) {
-    data class DetectedSwing(val startFrame: Int, val peakFrame: Int, val endFrame: Int)
+    data class DetectedSwing(
+        val startFrame: Int,
+        val peakFrame: Int,
+        val endFrame: Int,
+        /** Maximum rise speed of the coordinate between start and peak, coordinate units per second. */
+        val riseSpeed: Float = 0f
+    )
     data class Update(
         val calibrated: Boolean,
         val completedCount: Int,
@@ -28,6 +34,10 @@ class OnlineSwingSegmenter(
     private var start = 0
     private var peak = 0
     private var lastHeld = 0f
+    private var firstValidIndex = -1
+    private var lastValidIndex = -1
+    /** Median rise speed of the calibration swings; the reference for the slow-movement rule. */
+    private var referenceSpeed: Float? = null
 
     /** Call after the user has completed two or three calibration swings. */
     fun completeCalibration(): Update {
@@ -45,11 +55,21 @@ class OnlineSwingSegmenter(
             lastHeld = heldCoordinates.last()
             process(index)
         }
+        // Same rule as offline: the reference is the median over the candidate cycles, and
+        // cycles much slower than it (raising the racket into the ready position) are dropped.
+        referenceSpeed = detected.map { it.riseSpeed }.takeIf { it.isNotEmpty() }?.sorted()?.let { speeds ->
+            if (speeds.size % 2 == 0) (speeds[speeds.size / 2 - 1] + speeds[speeds.size / 2]) / 2f else speeds[speeds.size / 2]
+        }
+        detected.retainAll { !isTooSlow(it) }
         return Update(true, detected.size)
     }
 
     fun add(frame: Int, timestampUs: Long, coordinate: Float?): Update {
         samples += Sample(frame, timestampUs, coordinate)
+        if (coordinate != null) {
+            if (firstValidIndex < 0) firstValidIndex = samples.lastIndex
+            lastValidIndex = samples.lastIndex
+        }
         if (!calibrated) return Update(false, detected.size)
         heldCoordinates += coordinate ?: lastHeld
         lastHeld = heldCoordinates.last()
@@ -65,13 +85,15 @@ class OnlineSwingSegmenter(
      */
     fun finish(): Update {
         if (!calibrated || state != SWING || samples.isEmpty()) return Update(calibrated, detected.size)
-        val endIndex = samples.lastIndex
+        // Trailing setup frames (walking to the phone) carry no coordinate; the recording
+        // effectively ends at the last frame that has one, as offline.
+        val endIndex = lastValidIndex.takeIf { it >= 0 } ?: samples.lastIndex
         val peakAgeSeconds = (samples[endIndex].timestampUs - samples[peak].timestampUs) / 1_000_000f
         if (peakAgeSeconds < config.trailingPeakExclusionSeconds) return Update(true, detected.size)
         state = REST
         val durationSeconds = (samples[endIndex].timestampUs - samples[start].timestampUs) / 1_000_000f
-        val completed = if (durationSeconds >= config.minSwingDurationSeconds) {
-            DetectedSwing(samples[start].frame, samples[peak].frame, samples[endIndex].frame).also(detected::add)
+        val completed = if (durationSeconds >= config.minSwingDurationSeconds && start > firstValidIndex) {
+            candidate(start, peak, endIndex).takeUnless(::isTooSlow)?.also(detected::add)
         } else null
         return Update(true, detected.size, completed)
     }
@@ -101,12 +123,43 @@ class OnlineSwingSegmenter(
         if (value < lower) {
             state = REST
             val durationSeconds = (samples[index].timestampUs - samples[start].timestampUs) / 1_000_000f
-            if (durationSeconds >= config.minSwingDurationSeconds) {
-                return DetectedSwing(samples[start].frame, samples[peak].frame, samples[index].frame)
-                    .also(detected::add)
+            // A rise that began before the first usable frame was not seen: like offline, skip it.
+            if (durationSeconds >= config.minSwingDurationSeconds && start > firstValidIndex) {
+                // During the calibration replay there is no reference yet, so nothing is "too slow";
+                // completeCalibration() filters those candidates once the reference exists.
+                return candidate(start, peak, index).takeUnless(::isTooSlow)?.also(detected::add)
             }
         }
         return null
+    }
+
+    private fun candidate(start: Int, peak: Int, end: Int) =
+        DetectedSwing(samples[start].frame, samples[peak].frame, samples[end].frame, riseSpeed(start, peak))
+
+    private fun isTooSlow(swing: DetectedSwing): Boolean =
+        referenceSpeed?.let { swing.riseSpeed < config.minSwingSpeedFraction * it } ?: false
+
+    /**
+     * Five-frame Savitzky–Golay first derivative (quadratic fit; for a symmetric window it
+     * equals the least-squares slope), maximised over start..peak.  All frames it needs are
+     * already present when a swing completes, because the return happens after the peak.
+     */
+    private fun riseSpeed(start: Int, peak: Int): Float {
+        var best = 0f
+        for (centre in start..peak) {
+            var numerator = 0f
+            var weights = 0f
+            for (offset in -2..2) {
+                val index = (centre + offset).coerceIn(0, heldCoordinates.lastIndex)
+                numerator += offset * heldCoordinates[index]
+                weights += offset * offset
+            }
+            val previous = samples[(centre - 1).coerceAtLeast(0)].timestampUs
+            val next = samples[(centre + 1).coerceAtMost(samples.lastIndex)].timestampUs
+            val frameSeconds = ((next - previous) / 2_000_000f).takeIf { it > 0f } ?: (1f / config.segmentationFps)
+            best = maxOf(best, numerator / weights / frameSeconds)
+        }
+        return best
     }
 
     private fun percentile(values: List<Float>, fraction: Float): Float {

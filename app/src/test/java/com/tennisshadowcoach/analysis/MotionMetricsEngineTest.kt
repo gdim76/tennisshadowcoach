@@ -108,12 +108,12 @@ class MotionMetricsEngineTest {
         }
     }
 
-    @Test fun `live landmark replay matches offline count after three swing calibration`() {
+    @Test fun `live landmark replay matches offline count after two or three swing calibration`() {
         val mismatches = mutableListOf<String>()
-        knownRecordings().forEach { recording ->
+        for (calibrationSwings in listOf(2, 3)) knownRecordings().forEach { recording ->
             val frames = CsvPoseFrames.read(recording.csv)
             val offline = analyze(recording)
-            val calibrationEnd = offline.swings[2].endFrame
+            val calibrationEnd = offline.swings[calibrationSwings - 1].endFrame
             val tracker = OnlineLiveSwingTracker(recording.leadingHand)
             (0..calibrationEnd).forEach { index ->
                 tracker.add(frames[index].index, frames[index].timestampUs, frames[index].landmarks, frames[index].worldLandmarks)
@@ -124,11 +124,46 @@ class MotionMetricsEngineTest {
                 state = tracker.add(frames[index].index, frames[index].timestampUs, frames[index].landmarks, frames[index].worldLandmarks)
             }
             state = tracker.finish()
+            println("${recording.name} (calibration $calibrationSwings): offline=${offline.swings.map { it.startFrame to it.endFrame }}, live=${tracker.detectedSwings().map { it.startFrame to it.endFrame }}")
             if (state.completedCount != offline.swings.size) {
-                mismatches += "${recording.name}: offline=${offline.swings.size} live=${state.completedCount}"
+                mismatches += "${recording.name} (calibration $calibrationSwings): offline=${offline.swings.size} live=${state.completedCount}"
             }
         }
         assertTrue("Live landmark replay mismatches:\n${mismatches.joinToString("\n")}", mismatches.isEmpty())
+    }
+
+    @Test fun `known recordings stay stable across setup gate and slow movement parameter ranges`() {
+        val mismatches = mutableListOf<String>()
+        knownRecordings().forEach { recording ->
+            val frames = CsvPoseFrames.read(recording.csv)
+            for (tolerance in listOf(.2f, .25f, .3f, .4f)) for (run in listOf(.5f, 1f, 2f)) for (speed in listOf(.2f, .3f, .4f)) {
+                val count = MotionMetricsEngine.analyze(
+                    frames, recording.leadingHand, recording.recordingAngle,
+                    MetricsConfig(inPositionTorsoTolerance = tolerance, minInPositionSeconds = run, minSwingSpeedFraction = speed)
+                ).swings.size
+                if (count != recording.expectedSwings) {
+                    mismatches += "${recording.name}: tolerance=$tolerance run=$run speed=$speed expected=${recording.expectedSwings} actual=$count"
+                }
+            }
+        }
+        assertTrue("Gate/speed parameter mismatches:\n${mismatches.joinToString("\n")}", mismatches.isEmpty())
+    }
+
+    @Test fun `selfie front recording ignores setup at the phone and the slow racket raise`() {
+        val recording = knownRecordings().single { it.name.contains("front") }
+        val frames = CsvPoseFrames.read(recording.csv)
+        fun seconds(frame: Int) = (frames[frame].timestampUs - frames.first().timestampUs) / 1_000_000f
+        val defaults = analyze(recording)
+        // 0–4.5 s: pressing record, walking away and into place (video-checked).
+        assertTrue(defaults.swings.all { seconds(it.startFrame) > 4.5f })
+        assertTrue(defaults.debug.allSegments.none { seconds(it.peakFrame) < 3f })
+        // Raising the racket into the ready position (~6 s) crosses a low front threshold,
+        // but is far slower than the swings, so it is recorded and not counted.
+        val lowFront = MotionMetricsEngine.analyze(frames, recording.leadingHand, recording.recordingAngle, MetricsConfig(frontFrac = .4f))
+        val raise = lowFront.debug.allSegments.single { seconds(it.peakFrame) in 5f..7f }
+        assertTrue(raise.tooSlow)
+        assertFalse(raise.counted)
+        assertEquals(recording.expectedSwings, lowFront.swings.size)
     }
 
     @Test fun `impact is 0 point 1 to 0 point 45 seconds before coordinate peak for all labelled swings`() {

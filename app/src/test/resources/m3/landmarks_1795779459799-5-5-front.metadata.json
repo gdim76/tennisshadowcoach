@@ -9,9 +9,9 @@
   "recording_angle": "front",
   "phone_side": "unspecified",
   "leading_hand": "right",
-  "expected_swings": 10,
+  "expected_swings": 9,
   "manual_counts": {
-    "with_pauses": 5,
+    "with_pauses": 4,
     "continuous": 5
   },
   "config": {
@@ -26,5 +26,6 @@
     "back_frac": 0.25,
     "leading_hand": "right",
     "recording_angle": "front"
-  }
+  },
+  "metadata_note": "Исправлено 2026-11-27 по подтверждению владельца: 4 замаха с паузами + 5 подряд = 9. Суффикс 5-5 в имени файла ошибочный, имя оставлено для совместимости ссылок."
 }

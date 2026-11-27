@@ -24,11 +24,15 @@ CFG = dict(
     back_frac=0.25,      # замах закончился: рука вернулась ниже lo + back_frac * размах (0.15-0.3)
     min_dur_s=0.25,
     fps=30.0,
+    torso_tol=0.25,      # подготовка: размер торса в кадре вне [1/1.25, 1.25] от медианы записи (устойчиво 0.2-0.4)
+    min_in_pos_s=1.0,    # отрезки «на месте» короче этого — тоже подготовка (устойчиво 0.5-2 с)
+    min_speed_frac=0.3,  # замах: скорость подъёма >= доли медианы по кандидатам (устойчиво 0.2-0.4)
+    leading="right",
 )
 
 def torso_length(df):
     W = lambda k: np.c_[df[f"world_{k}_x"], df[f"world_{k}_y"], df[f"world_{k}_z"]]
-    return float(np.median(np.linalg.norm((W(11) + W(12)) / 2 - (W(23) + W(24)) / 2, axis=1)))
+    return float(np.nanmedian(np.linalg.norm((W(11) + W(12)) / 2 - (W(23) + W(24)) / 2, axis=1)))  # кадры без позы = NaN
 
 def clean_track(P, vis, torso, c=CFG):
     """P: Nx3 в метрах -> длины торса; маскируем плохие кадры и выбросы, чиним короткие дыры."""
@@ -54,7 +58,34 @@ def clean_track(P, vis, torso, c=CFG):
             i += 1
     return out
 
-def swing_coordinate(P, c=CFG):
+def in_position(df, c=CFG):
+    """Человек на рабочем расстоянии: длина торса в кадре (x-y) в пределах допуска от медианы записи,
+    непрерывно не меньше min_in_pos_s. Убирает подход к телефону и уход от него в начале и в конце записи."""
+    I = lambda k, a: df[f"image_{k}_{a}"].values
+    torso = np.hypot((I(11, "x") + I(12, "x") - I(23, "x") - I(24, "x")) / 2,
+                     (I(11, "y") + I(12, "y") - I(23, "y") - I(24, "y")) / 2)
+    r = torso / np.nanmedian(torso); up = 1 + c["torso_tol"]
+    ok = (~np.isnan(r)) & (r >= 1 / up) & (r <= up)
+    out = ok.copy(); run = int(c["min_in_pos_s"] * c["fps"]); i = 0
+    while i < len(ok):
+        if ok[i]:
+            j = i
+            while j < len(ok) and ok[j]: j += 1
+            if j - i < run: out[i:j] = False
+            i = j
+        else:
+            i += 1
+    return out
+
+def trailing_side(df, mask, c=CFG):
+    """Единичный вектор от бедра ведущей стороны к бедру ведомой (world)."""
+    W = lambda k: np.c_[df[f"world_{k}_x"], df[f"world_{k}_y"], df[f"world_{k}_z"]][mask]
+    v = W(23) - W(24) if c["leading"] == "right" else W(24) - W(23)
+    v = v / np.linalg.norm(v, axis=1)[:, None]
+    m = np.nanmean(v, axis=0)
+    return m / np.linalg.norm(m)
+
+def swing_coordinate(P, c=CFG, side=None):
     """Одна координата: проекция положения запястья на главную ось его движения."""
     ok = ~np.isnan(P[:, 0])
     X = P[ok] - P[ok].mean(axis=0)
@@ -63,7 +94,12 @@ def swing_coordinate(P, c=CFG):
     idx = np.arange(len(z)); good = ~np.isnan(z)
     zs = savgol_filter(np.interp(idx, idx[good], z[good]), c["smooth_win"], 2)
     zs[~good] = np.nan
-    if skew(zs[good]) < 0: zs = -zs        # исходное положение (где рука проводит больше времени) = низ
+    # Пик координаты — проводка; при ударе справа она уходит к ведомому боку тела. Это правило верно на
+    # всех размеченных роликах (косинус 0.61-0.79) и на калибровке из 2-3 замахов, где асимметрия
+    # распределения (skew) ненадёжна. Skew — запасной вариант, если ось почти перпендикулярна боку.
+    a = None if side is None else float(vt[0] @ side)
+    if (a is not None and abs(a) >= 0.3 and a < 0) or ((a is None or abs(a) < 0.3) and skew(zs[good]) < 0):
+        zs = -zs
     return zs
 
 def detect_swings(z, c=CFG):
@@ -92,31 +128,46 @@ def detect_swings(z, c=CFG):
         swings.append((start, pk, len(f) - 1))
     return swings
 
-def is_complete(sw, n, c=CFG):
-    """Неполный: не виден подъём (начало на кадре 0) или пик в последние 0.3 с записи."""
-    return sw[0] > 0 and sw[1] < n - 1 - int(0.3 * c["fps"])
+def is_complete(sw, z, c=CFG):
+    """Неполный: не виден подъём (начало на первом годном кадре) или пик в последние 0.3 с годных данных.
+    Кадры подготовки до и после рабочего отрезка считаются вне записи."""
+    good = np.flatnonzero(~np.isnan(z))
+    return sw[0] > good[0] and sw[1] < good[-1] - int(0.3 * c["fps"])
+
+def rise_speed(z, swing, win=5, c=CFG):
+    """Максимальная скорость подъёма координаты от начала до пика (та же производная, что у impact_moment)."""
+    a, p, _ = swing
+    zz = np.where(np.isnan(z), np.nanmin(z), z)
+    return float(savgol_filter(zz, win, 2, deriv=1, delta=1.0 / c["fps"])[a:p + 1].max())
 
 def run(path, c=CFG):
+    """Возвращает t, z, все окна и засчитанные замахи (полные и не медленные)."""
     df = pd.read_csv(path)
     t = (df.timestamp_us.values - df.timestamp_us.values[0]) / 1e6
     k = c["wrist"]
+    mask = in_position(df, c)
     P = np.c_[df[f"world_{k}_x"], df[f"world_{k}_y"], df[f"world_{k}_z"]]
-    P = clean_track(P, df[f"image_{k}_visibility"].values, torso_length(df), c)
-    z = swing_coordinate(P, c)
-    return t, z, detect_swings(z, c)
+    P = clean_track(P, np.where(mask, df[f"image_{k}_visibility"].values, 0.0), torso_length(df), c)
+    z = swing_coordinate(P, c, trailing_side(df, mask, c))
+    sw = detect_swings(z, c)
+    full = [s for s in sw if is_complete(s, z, c)]
+    if full:   # медленный подъём ракетки в готовую позицию — цикл положения, но не замах
+        speeds = np.array([rise_speed(z, s, c=c) for s in full])
+        full = [s for s, v in zip(full, speeds) if v >= c["min_speed_frac"] * np.median(speeds)]
+    return t, z, sw, full
 
 if __name__ == "__main__":
-    t, z, sw = run(sys.argv[1])
-    full = [s for s in sw if is_complete(s, len(z))]
-    print(f"найдено {len(sw)}, полных {len(full)}")
-    for a, p, b in sw:
-        tag = "" if is_complete((a, p, b), len(z)) else "  (обрезан записью)"
+    t, z, sw, full = run(sys.argv[1])
+    print(f"найдено окон {len(sw)}, засчитано {len(full)}")
+    for s in sw:
+        a, p, b = s
+        tag = "" if s in full else ("  (обрезан записью/подготовкой)" if not is_complete(s, z) else "  (медленное движение)")
         print(f"  начало {t[a]:5.2f}  пик {t[p]:5.2f}  конец {t[b]:5.2f} с{tag}")
 
 
 # ---- признаки замаха (после сегментации) ----
 
-def impact_moment(z, swing, win=7, c=CFG):
+def impact_moment(z, swing, win=5, c=CFG):
     """Момент удара: максимум производной координаты замаха на отрезке [начало, пик координаты].
     Не использовать максимум модуля скорости запястья по всему окну: на сбоях трекинга и на возврате
     руки он уходит на 0.3-0.7 с после пика."""

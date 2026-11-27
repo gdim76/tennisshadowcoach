@@ -29,7 +29,21 @@ data class MetricsConfig(
     val minSwingDurationSeconds: Float = 0.25f,
     val segmentationFps: Float = 30f,
     val reliableFrameFraction: Float = 0.7f,
-    val trailingPeakExclusionSeconds: Float = 0.3f
+    val trailingPeakExclusionSeconds: Float = 0.3f,
+    /**
+     * Setup gate: a frame counts only while the image torso length is within this relative
+     * tolerance of the recording median, i.e. the person stands at the working distance.
+     * It removes walking to/from the phone at the start and end of selfie recordings.
+     */
+    val inPositionTorsoTolerance: Float = 0.25f,
+    /** Shorter in-position runs are treated as setup (passing frames while walking). */
+    val minInPositionSeconds: Float = 1.0f,
+    /**
+     * A cycle counts as a swing only if its maximum rise speed along the swing axis reaches
+     * this fraction of the median over candidate cycles.  Slowly raising the racket into the
+     * ready position is a cycle of position, but not a swing.
+     */
+    val minSwingSpeedFraction: Float = 0.3f
 )
 
 data class MetricReading(
@@ -53,8 +67,12 @@ data class SwingSegment(
     val impactCoordinateSpeed: Float?,
     val impactFrame: Int?,
     val durationMs: Long,
-    val truncated: Boolean = false
-)
+    val truncated: Boolean = false,
+    /** Excluded because the rise was much slower than in the other swings of the recording. */
+    val tooSlow: Boolean = false
+) {
+    val counted: Boolean get() = !truncated && !tooSlow
+}
 
 data class SwingMetrics(
     val segment: SwingSegment,
@@ -295,7 +313,7 @@ object MotionMetricsEngine {
         val impactDerivative: List<Float?>
     )
 
-    /** Direct Kotlin port of data/swing_segmentation_reference.py. */
+    /** Kotlin port of swing_segmentation_reference.py in the repository root. */
     private fun segmentSwings(frames: List<PoseFrame>, hand: LeadingHand, config: MetricsConfig): Segmentation {
         val wrist = if (hand == LeadingHand.RIGHT) 16 else 15
         val torso = medianTorsoLength(frames.map { it.worldLandmarks }) ?: return Segmentation(emptyList(), emptyList(), List(frames.size) { null }, null, null)
@@ -304,9 +322,13 @@ object MotionMetricsEngine {
         val raw = frames.map { frame ->
             relativeToHips(frame.worldLandmarks.getOrNull(wrist), frame.worldLandmarks)?.div(torso)
         }
-        val visible = frames.map { frame -> (frame.landmarks.getOrNull(wrist)?.visibility ?: 0f) >= config.visibilityThreshold }
+        val inPosition = inPositionMask(frames, config)
+        val visible = frames.indices.map { index ->
+            inPosition[index] && (frames[index].landmarks.getOrNull(wrist)?.visibility ?: 0f) >= config.visibilityThreshold
+        }
         val points = cleanReferenceTrack(raw, visible, config)
-        val coordinates = swingCoordinates(points, config)
+        val trailingSide = trailingSideDirection(frames.indices.filter { visible[it] }.map { frames[it].worldLandmarks }, hand)
+        val coordinates = swingCoordinates(points, config, trailingSide)
         val coordinate = coordinates.segmentation
         val good = coordinate.filterNotNull()
         if (good.isEmpty()) return Segmentation(emptyList(), emptyList(), coordinate, null, null)
@@ -343,9 +365,54 @@ object MotionMetricsEngine {
         if (state == 1 && (frames.lastIndex - start) / config.segmentationFps >= config.minSwingDurationSeconds) {
             all += makeSegment(frames, coordinates.impactDerivative, start, peak, frames.lastIndex, truncated = false)
         }
+        // The usable recording runs from the first to the last frame with a coordinate: setup
+        // frames before and after are outside it, exactly like frames outside the video.
+        val firstValid = coordinate.indexOfFirst { it != null }
+        val lastValid = coordinate.indexOfLast { it != null }
         val tailFrames = (config.trailingPeakExclusionSeconds * config.segmentationFps).toInt()
-        val tagged = all.map { segment -> segment.copy(truncated = segment.startFrame == 0 || segment.peakFrame >= frames.size - 1 - tailFrames) }
-        return Segmentation(tagged.filterNot { it.truncated }, tagged, coordinate, back, front)
+        val bounded = all.map { segment ->
+            segment.copy(truncated = segment.startFrame <= firstValid || segment.peakFrame >= lastValid - tailFrames)
+        }
+        val speeds = bounded.filterNot { it.truncated }.mapNotNull { it.impactCoordinateSpeed }
+        val speedFloor = speeds.takeIf { it.isNotEmpty() }?.median()?.times(config.minSwingSpeedFraction)
+        val tagged = bounded.map { segment ->
+            if (segment.truncated || speedFloor == null) segment
+            else segment.copy(tooSlow = (segment.impactCoordinateSpeed ?: 0f) < speedFloor)
+        }
+        return Segmentation(tagged.filter { it.counted }, tagged, coordinate, back, front)
+    }
+
+    /**
+     * True where the person is at the working distance: the image torso length is within
+     * [MetricsConfig.inPositionTorsoTolerance] of the recording median, for a continuous run of
+     * at least [MetricsConfig.minInPositionSeconds].
+     */
+    internal fun inPositionMask(frames: List<PoseFrame>, config: MetricsConfig): List<Boolean> {
+        val torso = frames.map { imageTorsoLength2d(it.landmarks) }
+        val median = torso.filterNotNull().takeIf { it.isNotEmpty() }?.median() ?: return List(frames.size) { true }
+        if (median <= EPSILON) return List(frames.size) { true }
+        val upper = 1f + config.inPositionTorsoTolerance
+        val raw = torso.map { length -> length != null && length / median in (1f / upper)..upper }
+        val minRun = (config.minInPositionSeconds * config.segmentationFps).toInt()
+        val mask = raw.toMutableList()
+        var start = 0
+        while (start < mask.size) {
+            if (!raw[start]) { start++; continue }
+            var end = start
+            while (end < mask.size && raw[end]) end++
+            if (end - start < minRun) for (index in start until end) mask[index] = false
+            start = end
+        }
+        return mask
+    }
+
+    /** Shoulder-midpoint to hip-midpoint distance in normalised image x/y. */
+    internal fun imageTorsoLength2d(points: List<ImageLandmark?>): Float? {
+        val ls = points.getOrNull(11) ?: return null; val rs = points.getOrNull(12) ?: return null
+        val lh = points.getOrNull(23) ?: return null; val rh = points.getOrNull(24) ?: return null
+        val dx = (ls.x + rs.x - lh.x - rh.x) / 2f
+        val dy = (ls.y + rs.y - lh.y - rh.y) / 2f
+        return sqrt(dx * dx + dy * dy)
     }
 
     private fun makeSegment(
@@ -453,7 +520,7 @@ object MotionMetricsEngine {
         return wrist?.toVec()?.minus(hip)
     }
 
-    private data class Vec3(val x: Float, val y: Float, val z: Float) {
+    internal data class Vec3(val x: Float, val y: Float, val z: Float) {
         operator fun minus(other: Vec3) = Vec3(x-other.x,y-other.y,z-other.z)
         operator fun div(scale: Float) = Vec3(x / scale, y / scale, z / scale)
         fun dot(o: Vec3)=x*o.x+y*o.y+z*o.z
@@ -484,7 +551,7 @@ object MotionMetricsEngine {
      * The segmentation coordinate uses its configured long window.  Impact timing uses the
      * identical projection, but a separate 5–7 frame Savitzky–Golay derivative.
      */
-    private fun swingCoordinates(points: List<Vec3?>, config: MetricsConfig): SwingCoordinates {
+    private fun swingCoordinates(points: List<Vec3?>, config: MetricsConfig, trailingSide: Vec3?): SwingCoordinates {
         val valid = points.filterNotNull()
         if (valid.size < 3) return SwingCoordinates(List(points.size) { null }, List(points.size) { null })
         val mean = meanVec(valid)
@@ -500,9 +567,36 @@ object MotionMetricsEngine {
         )
         val segmentation = raw.indices.map { index -> segmentationSmoothed[index].takeIf { raw[index] != null } }
         val impact = raw.indices.map { index -> impactDerivative[index].takeIf { raw[index] != null } }
-        return if (skew(segmentation.filterNotNull()) < 0f) {
+        return if (shouldFlip(axis, trailingSide, segmentation.filterNotNull())) {
             SwingCoordinates(segmentation.map { it?.unaryMinus() }, impact.map { it?.unaryMinus() })
         } else SwingCoordinates(segmentation, impact)
+    }
+
+    /**
+     * Orientation of the swing coordinate.  The coordinate peak is the follow-through, which for a
+     * forehand ends towards the trailing (non-leading) side of the body, so the axis is oriented
+     * towards that side.  This holds on every labelled recording (cosine 0.61–0.79) and, unlike
+     * the skew of the distribution, also on a 2–3 swing calibration.  When the axis is nearly
+     * perpendicular to the body side (or hips are missing) the skew rule is the fallback.
+     */
+    private fun shouldFlip(axis: Vec3, trailingSide: Vec3?, coordinate: List<Float>): Boolean {
+        val alignment = trailingSide?.let { axis.dot(it) }
+        return if (alignment != null && abs(alignment) >= SIDE_ALIGNMENT_MIN) alignment < 0f
+        else skew(coordinate) < 0f
+    }
+
+    /** Mean unit vector from the leading hip to the trailing hip in world coordinates. */
+    internal fun trailingSideDirection(frames: List<List<WorldLandmark?>>, hand: LeadingHand): Vec3? {
+        val directions = frames.mapNotNull { points ->
+            val left = points.getOrNull(23)?.toVec() ?: return@mapNotNull null
+            val right = points.getOrNull(24)?.toVec() ?: return@mapNotNull null
+            val towardLeft = left - right
+            val length = towardLeft.length()
+            if (length <= EPSILON) null else (if (hand == LeadingHand.RIGHT) towardLeft else right - left) / length
+        }
+        if (directions.isEmpty()) return null
+        val mean = meanVec(directions)
+        return mean.length().takeIf { it > EPSILON }?.let { mean / it }
     }
 
     private fun savitzkyGolayReference(values: List<Float>, requestedWindow: Int): List<Float> {
@@ -646,6 +740,7 @@ object MotionMetricsEngine {
     private fun percentile(values: List<Float>, fraction: Float): Float { val sorted = values.sorted(); val position = fraction.coerceIn(0f, 1f) * (sorted.size - 1); val low = position.toInt(); return sorted[low].lerp(sorted[(low + 1).coerceAtMost(sorted.lastIndex)], position - low) }
     private fun Float.pow(power: Int): Float { var result = 1f; repeat(power) { result *= this }; return result }
     private const val EPSILON = 1e-6f
+    private const val SIDE_ALIGNMENT_MIN = 0.3f
 }
 
 private fun <T> interpolate(values: List<T?>, maxGap: Int, blend: (T,T,Float)->T): List<T?> {

@@ -13,12 +13,22 @@ class OnlineLiveSwingTracker(
 ) {
     data class State(val calibrated: Boolean, val completedCount: Int, val justCompleted: Boolean)
 
-    private data class Sample(val frame: Int, val timestampUs: Long, val point: Vec?)
+    private data class Sample(
+        val frame: Int,
+        val timestampUs: Long,
+        val point: Vec?,
+        val imageTorso: Float?,
+        val world: List<WorldLandmark?>
+    )
     private val calibration = mutableListOf<Sample>()
     private var mean: Vec? = null
     private var axis: Vec? = null
     private var sign = 1f
     private var segmenter: OnlineSwingSegmenter? = null
+    /** Working-distance image torso length, the median over the calibration frames. */
+    private var referenceTorso: Float? = null
+    private var inPosition = false
+    private var positionRun = 0
 
     fun add(
         frame: Int,
@@ -30,18 +40,26 @@ class OnlineLiveSwingTracker(
         val point = if ((image.getOrNull(wrist)?.visibility ?: 0f) >= config.visibilityThreshold) {
             normalizedRelativeWrist(world.getOrNull(wrist), world)
         } else null
+        val torso = MotionMetricsEngine.imageTorsoLength2d(image)
         val active = segmenter
         if (active == null) {
-            calibration += Sample(frame, timestampUs, point)
+            calibration += Sample(frame, timestampUs, point, torso, world)
             return State(false, 0, false)
         }
-        val coordinate = point?.let { toCoordinate(it) }
+        val coordinate = point?.takeIf { updatePosition(torso) }?.let { toCoordinate(it) }
         val update = active.add(frame, timestampUs, coordinate)
         return State(true, update.completedCount, update.completedSwing != null)
     }
 
     fun completeCalibration(): State {
-        val points = calibration.mapNotNull { it.point }
+        // Setup frames (walking away from the phone) are removed exactly as offline: the whole
+        // calibration buffer is known, so the non-causal run-length rule can be used here.
+        referenceTorso = calibration.mapNotNull { it.imageTorso }.takeIf { it.isNotEmpty() }?.sorted()?.let { it[it.size / 2] }
+        val positioned = calibrationPositionMask()
+        val usable = calibration.mapIndexed { index, sample -> sample.point.takeIf { positioned[index] } }
+        inPosition = positioned.lastOrNull() ?: false
+        positionRun = if (inPosition) minPositionRun() else 0
+        val points = usable.filterNotNull()
         require(points.size >= 3) { "Для калибровки не хватает видимых точек запястья." }
         val centre = Vec(
             points.map { it.x }.average().toFloat(),
@@ -52,8 +70,16 @@ class OnlineLiveSwingTracker(
             ?: error("Для калибровки нужен заметный размах движения.")
         mean = centre
         axis = mainAxis
-        val raw = calibration.map { it.point?.let(::toCoordinateUnflipped) }
-        if (skew(raw.filterNotNull()) < 0f) sign = -1f
+        val raw = usable.map { it?.let(::toCoordinateUnflipped) }
+        // Same orientation rule as offline: towards the trailing side of the body, with the
+        // distribution skew only as a fallback.  Skew alone is unreliable on 2–3 swings.
+        val side = MotionMetricsEngine.trailingSideDirection(
+            calibration.indices.filter { usable[it] != null }.map { calibration[it].world }, leadingHand
+        )
+        val alignment = side?.let { mainAxis.x * it.x + mainAxis.y * it.y + mainAxis.z * it.z }
+        sign = if (alignment != null && kotlin.math.abs(alignment) >= SIDE_ALIGNMENT_MIN) {
+            if (alignment < 0f) -1f else 1f
+        } else if (skew(raw.filterNotNull()) < 0f) -1f else 1f
         val online = OnlineSwingSegmenter(config)
         calibration.forEachIndexed { index, sample ->
             online.add(sample.frame, sample.timestampUs, raw[index]?.times(sign))
@@ -63,9 +89,46 @@ class OnlineLiveSwingTracker(
         return State(true, update.completedCount, false)
     }
 
+    fun detectedSwings(): List<OnlineSwingSegmenter.DetectedSwing> = segmenter?.detectedSwings().orEmpty()
+
     fun finish(): State {
         val update = segmenter?.finish() ?: return State(false, 0, false)
         return State(true, update.completedCount, update.completedSwing != null)
+    }
+
+    private fun withinTolerance(torso: Float?): Boolean {
+        val reference = referenceTorso ?: return true
+        if (torso == null || reference <= EPSILON) return false
+        val upper = 1f + config.inPositionTorsoTolerance
+        return torso / reference in (1f / upper)..upper
+    }
+
+    private fun minPositionRun(): Int = (config.minInPositionSeconds * config.segmentationFps).toInt().coerceAtLeast(1)
+
+    private fun calibrationPositionMask(): List<Boolean> {
+        val raw = calibration.map { withinTolerance(it.imageTorso) }
+        val mask = raw.toMutableList()
+        var start = 0
+        while (start < raw.size) {
+            if (!raw[start]) { start++; continue }
+            var end = start
+            while (end < raw.size && raw[end]) end++
+            if (end - start < minPositionRun()) for (index in start until end) mask[index] = false
+            start = end
+        }
+        return mask
+    }
+
+    /**
+     * Causal version of the offline gate.  The person is "in position" after a continuous run of
+     * frames at the working distance and leaves it after an equally long run away from it.
+     * Single frames outside the tolerance are always ignored.
+     */
+    private fun updatePosition(torso: Float?): Boolean {
+        val ok = withinTolerance(torso)
+        if (ok == inPosition) positionRun = 0 else positionRun++
+        if (positionRun >= minPositionRun()) { inPosition = ok; positionRun = 0 }
+        return ok && inPosition
     }
 
     private fun toCoordinate(point: Vec): Float = toCoordinateUnflipped(point) * sign
@@ -109,5 +172,8 @@ class OnlineLiveSwingTracker(
             .average().toFloat() / sqrt(second * second * second)
     }
 
-    private companion object { const val EPSILON = 1e-6f }
+    private companion object {
+        const val EPSILON = 1e-6f
+        const val SIDE_ALIGNMENT_MIN = 0.3f
+    }
 }

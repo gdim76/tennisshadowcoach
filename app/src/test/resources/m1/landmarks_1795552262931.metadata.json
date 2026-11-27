@@ -3,5 +3,9 @@
   "recording_angle": "angle_45",
   "phone_side": "unspecified",
   "leading_hand": "right",
-  "expected_swings": 8
+  "expected_swings": 8,
+  "manual_counts": {
+    "with_pauses": 8,
+    "continuous": null
+  }
 }

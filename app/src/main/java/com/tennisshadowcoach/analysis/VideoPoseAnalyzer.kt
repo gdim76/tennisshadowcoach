@@ -37,6 +37,9 @@ data class AnalysisConfig(
     val swingCoordinateSmoothingWindowFrames: Int = 9,
     val frontFrac: Float = 0.6f,
     val backFrac: Float = 0.25f,
+    val inPositionTorsoTolerance: Float = 0.25f,
+    val minInPositionSeconds: Float = 1.0f,
+    val minSwingSpeedFraction: Float = 0.3f,
     val leadingHand: LeadingHand = LeadingHand.RIGHT,
     val recordingAngle: RecordingAngle = RecordingAngle.SIDE,
     val recordingMetadata: RecordingMetadata = RecordingMetadata()
@@ -172,7 +175,10 @@ class VideoPoseAnalyzer(
                 angleSmoothingWindowFrames = config.angleSmoothingWindowFrames,
                 swingCoordinateSmoothingWindowFrames = config.swingCoordinateSmoothingWindowFrames,
                 frontFrac = config.frontFrac,
-                backFrac = config.backFrac
+                backFrac = config.backFrac,
+                inPositionTorsoTolerance = config.inPositionTorsoTolerance,
+                minInPositionSeconds = config.minInPositionSeconds,
+                minSwingSpeedFraction = config.minSwingSpeedFraction
             )
         )
         val swingsCsvFile = File(csvFile.parentFile, "swings_${csvFile.nameWithoutExtension}.csv")
@@ -326,6 +332,9 @@ private object AnalysisMetadataExporter {
                 "swing_coordinate_smoothing_window_frames": ${config.swingCoordinateSmoothingWindowFrames},
                 "front_frac": ${config.frontFrac},
                 "back_frac": ${config.backFrac},
+                "in_position_torso_tolerance": ${config.inPositionTorsoTolerance},
+                "min_in_position_seconds": ${config.minInPositionSeconds},
+                "min_swing_speed_fraction": ${config.minSwingSpeedFraction},
                 "leading_hand": "${config.recordingMetadata.leadingHand?.name?.lowercase() ?: "unspecified"}",
                 "recording_angle": "${config.recordingMetadata.recordingAngle.wireValue}"
               }

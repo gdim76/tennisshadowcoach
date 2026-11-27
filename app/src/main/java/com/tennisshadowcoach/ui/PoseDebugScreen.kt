@@ -217,7 +217,11 @@ private fun MotionChart(
         fun y(value: Float): Float = size.height - (value - minValue) / span * size.height
         segments.forEach { segment ->
             drawRect(
-                color = if (segment.truncated) Color(0x33FF9800) else Color(0x332196F3),
+                color = when {
+                    segment.truncated -> Color(0x33FF9800)
+                    segment.tooSlow -> Color(0x339E9E9E)
+                    else -> Color(0x332196F3)
+                },
                 topLeft = androidx.compose.ui.geometry.Offset(x(segment.startFrame), 0f),
                 size = androidx.compose.ui.geometry.Size(x(segment.endFrame) - x(segment.startFrame), size.height)
             )
