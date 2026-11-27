@@ -144,10 +144,28 @@ fun PoseDebugScreen(
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
 
+        ViewSummary(analysis.motion.view)
+
         SwingCharts(
             debug = analysis.motion.debug,
             metrics = analysis.motion.swingMetrics,
             modifier = Modifier.fillMaxWidth()
+        )
+    }
+}
+
+/** Measured, not declared: shown so the per-view accuracy of metrics can be checked. */
+@Composable
+private fun ViewSummary(view: com.tennisshadowcoach.analysis.ViewEstimate) {
+    fun deg(value: Float?) = value?.let { "%.0f°".format(it) } ?: "—"
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Text("Поворот тела к камере: ${view.view.label}", style = MaterialTheme.typography.titleSmall)
+        Text(
+            "Поворот бёдер к камере ${deg(view.hipYawDegrees)}, плеч ${deg(view.shoulderYawDegrees)} · " +
+                "камера ${view.cameraSide.label} · ширина плеч в кадре ${view.imageShoulderWidthToTorso?.let { "%.2f".format(it) } ?: "—"} торса · " +
+                "кадров покоя ${view.restFrames}. Это поворот тела в паузах (положение телефона и разворот стойки вместе), оценка по глубине MediaPipe; границы категорий не проверены по эталону.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
         )
     }
 }
@@ -169,7 +187,7 @@ private fun SwingCharts(debug: SwingDebugData, metrics: List<SwingMetrics>, modi
             lineColor = Color(0xFF9C6CFF),
             modifier = Modifier.fillMaxWidth().height(150.dp)
         )
-        Text("Скорость запястья, длин торса/с", style = MaterialTheme.typography.bodySmall)
+        Text("Скорость запястья, длин торса/с (отладочная)", style = MaterialTheme.typography.bodySmall)
         MotionChart(
             values = debug.wristSpeed,
             segments = emptyList(),
@@ -185,9 +203,9 @@ private fun SwingCharts(debug: SwingDebugData, metrics: List<SwingMetrics>, modi
             metrics.forEachIndexed { index, swing ->
                 val segment = swing.segment
                 Text(
-                    "${index + 1}. ${segment.durationMs} мс · пик скорости ${segment.peakSpeed?.let { "%.1f".format(it) } ?: "—"} торс/с · " +
+                    "${index + 1}. ${segment.durationMs} мс · момент удара ${segment.impactFrame?.let { "кадр ${it}" } ?: "—"} · " +
                         "колено ${formatMetric(swing.leadingKnee)} · " +
-                        "локоть ${formatMetric(swing.leadingElbow)} · корпус ${formatMetric(swing.trunkLean)}",
+                        "локоть ${formatMetric(swing.leadingElbow)} · наклон корпуса (3D, от вертикали, без знака) ${formatMetric(swing.trunkLean)}",
                     style = MaterialTheme.typography.bodySmall
                 )
             }
@@ -217,7 +235,11 @@ private fun MotionChart(
         fun y(value: Float): Float = size.height - (value - minValue) / span * size.height
         segments.forEach { segment ->
             drawRect(
-                color = if (segment.truncated) Color(0x33FF9800) else Color(0x332196F3),
+                color = when {
+                    segment.truncated -> Color(0x33FF9800)
+                    segment.tooSlow -> Color(0x339E9E9E)
+                    else -> Color(0x332196F3)
+                },
                 topLeft = androidx.compose.ui.geometry.Offset(x(segment.startFrame), 0f),
                 size = androidx.compose.ui.geometry.Size(x(segment.endFrame) - x(segment.startFrame), size.height)
             )
@@ -242,7 +264,7 @@ private fun formatAngle(value: Float?): String = value?.let { "%.0f°".format(it
 
 private fun formatMetric(metric: MetricSummary): String =
     if (!metric.available) "недоступно для ракурса"
-    else if (metric.reliable) formatAngle(metric.atPeak)
+    else if (metric.reliable) formatAngle(metric.atImpact)
     else "ненадёжно (${(metric.validFrameFraction * 100).toInt()}%)"
 
 @Composable

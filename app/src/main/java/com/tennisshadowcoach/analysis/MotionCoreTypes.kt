@@ -6,7 +6,6 @@ package com.tennisshadowcoach.analysis
  * CSV track on a regular JVM.
  */
 enum class LeadingHand { RIGHT, LEFT }
-enum class RecordingAngle { SIDE, FRONT_OR_45 }
 
 data class ImageLandmark(
     val x: Float,

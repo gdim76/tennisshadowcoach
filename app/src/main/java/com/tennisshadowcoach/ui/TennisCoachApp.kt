@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -28,10 +29,12 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -40,6 +43,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -47,7 +51,7 @@ import androidx.core.content.FileProvider
 import com.tennisshadowcoach.analysis.AnalysisProgress
 import com.tennisshadowcoach.analysis.AnalysisConfig
 import com.tennisshadowcoach.analysis.LeadingHand
-import com.tennisshadowcoach.analysis.RecordingAngle
+import com.tennisshadowcoach.analysis.RecordingMetadata
 import com.tennisshadowcoach.analysis.VideoAnalysis
 import com.tennisshadowcoach.analysis.VideoPoseAnalyzer
 import com.tennisshadowcoach.coach.CoachSettingsStore
@@ -67,29 +71,52 @@ fun TennisCoachApp() {
     var analysis by remember { mutableStateOf<VideoAnalysis?>(null) }
     var progress by remember { mutableStateOf<AnalysisProgress?>(null) }
     var analyzing by remember { mutableStateOf(false) }
+    // Interim mitigation for the open lock-screen issue: the screen stays on while every frame
+    // is analysed, and the normal timeout returns as soon as the analysis ends.
+    val hostView = LocalView.current
+    DisposableEffect(analyzing) {
+        val previous = hostView.keepScreenOn
+        if (analyzing) hostView.keepScreenOn = true
+        onDispose { hostView.keepScreenOn = previous }
+    }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var recordingNotice by remember { mutableStateOf<String?>(null) }
     var showCamera by remember { mutableStateOf(false) }
+    var showLiveMirror by remember { mutableStateOf(false) }
+    var openLiveAfterPermission by remember { mutableStateOf(false) }
     var showDebug by remember { mutableStateOf(false) }
     var showCoachSession by remember { mutableStateOf(false) }
-    var leadingHand by remember { mutableStateOf(LeadingHand.RIGHT) }
-    var recordingAngle by remember { mutableStateOf(RecordingAngle.SIDE) }
-    val latestRecording = remember(context) { findLatestRecording(context) }
+    val capturePreferences = remember(context) { CapturePreferences(context) }
+    // Camera and leading hand survive restarts; per-recording diagnostic fields do not.
+    var recordingMetadata by remember { mutableStateOf(capturePreferences.load()) }
+    fun updateMetadata(updated: RecordingMetadata) {
+        recordingMetadata = updated
+        capturePreferences.save(updated)
+    }
+    // Re-read after returning from the camera so a new recording appears in the list.
+    val recordings = remember(context, showCamera) { savedRecordings(context) }
     val coachStore = remember(context) { CoachSettingsStore(context) }
     var coachDraft by remember { mutableStateOf(coachStore.load()) }
 
     val cameraPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
-        if (granted) showCamera = true
+        if (granted && openLiveAfterPermission) {
+            openLiveAfterPermission = false
+            showLiveMirror = true
+        } else if (granted) showCamera = true
         else errorMessage = "Для записи видео нужен доступ к камере."
     }
 
     if (showCamera) {
+        BackHandler { showCamera = false }
         CameraRecordScreen(
+            metadata = recordingMetadata,
+            onMetadataChange = { updateMetadata(it) },
             onBack = { showCamera = false },
-            onVideoSaved = { uri, notice ->
+            onVideoSaved = { uri, notice, metadata ->
                 videoUri = uri
+                updateMetadata(metadata)
                 analysis = null
                 progress = null
                 recordingNotice = notice
@@ -99,7 +126,17 @@ fun TennisCoachApp() {
         return
     }
 
+    if (showLiveMirror) {
+        val hand = recordingMetadata.leadingHand
+        if (hand != null) {
+            LiveMirrorScreen(leadingHand = hand, onBack = { showLiveMirror = false })
+            return
+        }
+        showLiveMirror = false
+    }
+
     if (showDebug && analysis != null) {
+        BackHandler { showDebug = false }
         PoseDebugScreen(
             analysis = analysis!!,
             onBack = { showDebug = false }
@@ -108,6 +145,7 @@ fun TennisCoachApp() {
     }
 
     if (showCoachSession) {
+        BackHandler { showCoachSession = false }
         CoachSessionScreen(
             draft = coachDraft,
             onChange = { updated -> coachDraft = updated; coachStore.save(updated) },
@@ -122,7 +160,7 @@ fun TennisCoachApp() {
                 title = {
                     Column {
                         Text("Tennis Shadow Coach", fontWeight = FontWeight.Bold)
-                        Text("M2 · заметки и фокусы тренера", style = MaterialTheme.typography.labelSmall)
+                        Text("Разбор записи, заметки тренера, зеркало", style = MaterialTheme.typography.labelSmall)
                     }
                 }
             )
@@ -139,7 +177,7 @@ fun TennisCoachApp() {
             Card {
                 Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("Запись для разбора", style = MaterialTheme.typography.titleLarge)
-                    Text("Сними 30–60 секунд. Камера должна видеть тело целиком; для бокового разбора ставь телефон перпендикулярно движению.")
+                    Text("Сними 30–60 секунд. Камера должна видеть тело целиком, от головы до стоп. Ракурс приложение определит само.")
                     Text(
                         "На этом этапе приложение сохраняет сырые точки тела и не оценивает технику.",
                         style = MaterialTheme.typography.bodySmall,
@@ -154,17 +192,8 @@ fun TennisCoachApp() {
 
             Card {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("Параметры M1", style = MaterialTheme.typography.titleMedium)
-                    Text("Ведущая рука", style = MaterialTheme.typography.bodySmall)
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        FilterChip(leadingHand == LeadingHand.RIGHT, { leadingHand = LeadingHand.RIGHT }, label = { Text("Правая") })
-                        FilterChip(leadingHand == LeadingHand.LEFT, { leadingHand = LeadingHand.LEFT }, label = { Text("Левая") })
-                    }
-                    Text("Ракурс", style = MaterialTheme.typography.bodySmall)
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        FilterChip(recordingAngle == RecordingAngle.SIDE, { recordingAngle = RecordingAngle.SIDE }, label = { Text("Сбоку") })
-                        FilterChip(recordingAngle == RecordingAngle.FRONT_OR_45, { recordingAngle = RecordingAngle.FRONT_OR_45 }, label = { Text("Спереди / 45°") })
-                    }
+                    Text("Условия записи", style = MaterialTheme.typography.titleMedium)
+                    RecordingMetadataEditor(recordingMetadata, { updateMetadata(it) })
                 }
             }
 
@@ -181,14 +210,59 @@ fun TennisCoachApp() {
                 Text("Записать тренировку")
             }
 
-            if (videoUri == null && latestRecording != null) {
-                Button(
-                    onClick = { videoUri = Uri.fromFile(latestRecording) },
-                    modifier = Modifier.fillMaxWidth()
-                ) { Text("Открыть последнюю запись") }
+            Button(
+                enabled = recordingMetadata.leadingHand != null,
+                onClick = {
+                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
+                        PackageManager.PERMISSION_GRANTED
+                    ) {
+                        showLiveMirror = true
+                    } else {
+                        openLiveAfterPermission = true
+                        cameraPermission.launch(Manifest.permission.CAMERA)
+                    }
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("Открыть зеркало (подготовка M3)") }
+            if (recordingMetadata.leadingHand == null) {
+                Text("Для зеркала сначала выбери ведущую руку в метаданных.", style = MaterialTheme.typography.bodySmall)
+            }
+
+            if (recordings.isNotEmpty()) {
+                Text("Сохранённые записи", style = MaterialTheme.typography.titleSmall)
+                val format = remember { java.text.SimpleDateFormat("dd.MM HH:mm", java.util.Locale("ru")) }
+                recordings.take(MAX_LISTED_RECORDINGS).forEach { file ->
+                    val uri = Uri.fromFile(file)
+                    val selected = uri == videoUri
+                    OutlinedButton(
+                        onClick = {
+                            if (!analyzing && !selected) {
+                                videoUri = uri
+                                analysis = null
+                                progress = null
+                                errorMessage = null
+                                // Diagnostic facts belong to one recording: do not carry them over.
+                                recordingMetadata = recordingMetadata.copy(
+                                    recordingAngle = com.tennisshadowcoach.analysis.CaptureRecordingAngle.UNSPECIFIED,
+                                    phoneSide = com.tennisshadowcoach.analysis.PhoneSide.UNSPECIFIED,
+                                    manualPausedSwings = null,
+                                    manualSeriesSwings = null
+                                )
+                            }
+                        },
+                        enabled = !analyzing,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            (if (selected) "✓ " else "") + format.format(java.util.Date(file.lastModified())) +
+                                " · ${file.length() / 1_000_000} МБ"
+                        )
+                    }
+                }
             }
 
             videoUri?.let { selectedVideo ->
+                val hand = recordingMetadata.leadingHand
                 Card {
                     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -201,8 +275,18 @@ fun TennisCoachApp() {
                             Text("Видео готово к анализу", fontWeight = FontWeight.SemiBold)
                         }
                         Text("Будет обработан каждый кадр видеодорожки с его исходной временной меткой.")
+                        if (hand == null) {
+                            Text(
+                                "Для разбора выбери ведущую руку выше.",
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        }
+                        Text(
+                            "Не блокируй телефон до конца анализа: экран результата после блокировки пока не восстанавливается.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
                         Button(
-                            enabled = !analyzing,
+                            enabled = !analyzing && hand != null,
                             onClick = {
                                 analyzing = true
                                 progress = null
@@ -213,7 +297,10 @@ fun TennisCoachApp() {
                                         analysis = withContext(Dispatchers.IO) {
                                             VideoPoseAnalyzer(
                                                 context,
-                                                AnalysisConfig(leadingHand = leadingHand, recordingAngle = recordingAngle)
+                                                AnalysisConfig(
+                                                    leadingHand = hand ?: LeadingHand.RIGHT,
+                                                    recordingMetadata = recordingMetadata
+                                                )
                                             ).analyze(selectedVideo) { update -> progress = update }
                                         }
                                     } catch (error: Throwable) {
@@ -285,7 +372,7 @@ private fun AnalysisResultCard(
             MetricRow("Найдено замахов", analysis.motion.swings.size.toString())
             analysis.motion.swings.forEachIndexed { index, swing ->
                 Text(
-                    "Замах ${index + 1}: ${swing.durationMs} мс · пик ${"%.2f".format(swing.peakSpeed)} торса/с",
+                    "Замах ${index + 1}: ${swing.durationMs} мс · момент удара ${swing.impactFrame?.let { "кадр $it" } ?: "не найден"}",
                     style = MaterialTheme.typography.bodySmall
                 )
             }
@@ -302,7 +389,8 @@ private fun AnalysisResultCard(
                         )
                     } else {
                         FocusRuleEvaluator.evaluate(analysis.motion, rule).forEach { result ->
-                            val value = result.value?.let { " · ${"%.0f".format(it)}°" }.orEmpty()
+                            // One decimal: a whole-degree value equal to the limit would look "in range" when it is not.
+                            val value = result.value?.let { " · ${"%.1f".format(it)}°" }.orEmpty()
                             Text(
                                 "Замах ${result.swingNumber}: ${result.status.label}$value",
                                 style = MaterialTheme.typography.bodySmall,
@@ -353,7 +441,4 @@ private fun shareCsv(context: android.content.Context, file: java.io.File) {
     context.startActivity(Intent.createChooser(shareIntent, "Экспорт CSV"))
 }
 
-private fun findLatestRecording(context: android.content.Context): File? =
-    File(context.getExternalFilesDir(null), "TennisShadowCoach")
-        .listFiles { file -> file.extension.equals("mp4", ignoreCase = true) }
-        ?.maxByOrNull(File::lastModified)
+private const val MAX_LISTED_RECORDINGS = 8

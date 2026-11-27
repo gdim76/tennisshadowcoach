@@ -37,8 +37,11 @@ data class AnalysisConfig(
     val swingCoordinateSmoothingWindowFrames: Int = 9,
     val frontFrac: Float = 0.6f,
     val backFrac: Float = 0.25f,
+    val inPositionTorsoTolerance: Float = 0.25f,
+    val minInPositionSeconds: Float = 1.0f,
+    val minSwingSpeedFraction: Float = 0.3f,
     val leadingHand: LeadingHand = LeadingHand.RIGHT,
-    val recordingAngle: RecordingAngle = RecordingAngle.SIDE
+    val recordingMetadata: RecordingMetadata = RecordingMetadata()
 )
 
 data class AnalysisProgress(
@@ -96,7 +99,7 @@ class VideoPoseAnalyzer(
         val landmarker = PoseLandmarker.createFromOptions(context, options)
         var lastMediaPipeTimestampMs = -1L
 
-        try {
+        val motion = try {
             retriever.setDataSource(context, videoUri)
             val videoMetadata = VideoMetadata(
                 width = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull(),
@@ -148,7 +151,16 @@ class VideoPoseAnalyzer(
                     )
                 }
             }
-            AnalysisMetadataExporter.write(exportFiles.metadataFile, videoMetadata, config)
+            // Metrics are computed before the sidecar is written so that the measured view
+            // (body orientation to the camera) is stored next to the user's declared facts.
+            val result = MotionMetricsEngine.analyze(
+                frames = frames,
+                leadingHand = config.leadingHand,
+                config = config.metricsConfig(),
+                imageAspect = videoMetadata.displayAspect()
+            )
+            AnalysisMetadataExporter.write(exportFiles.metadataFile, videoMetadata, config, result.view)
+            result
         } catch (error: Throwable) {
             csvFile.delete()
             exportFiles.metadataFile.delete()
@@ -158,22 +170,6 @@ class VideoPoseAnalyzer(
             landmarker.close()
         }
 
-        val motion = MotionMetricsEngine.analyze(
-            frames = frames,
-            leadingHand = config.leadingHand,
-            recordingAngle = config.recordingAngle,
-            config = MetricsConfig(
-                visibilityThreshold = config.visibilityThreshold,
-                outlierMedianWindowFrames = config.outlierMedianWindowFrames,
-                outlierMedianDeviationTorsoLengths = config.outlierMedianDeviationTorsoLengths,
-                maxInterpolationGapFrames = config.maxInterpolationGapFrames,
-                speedSmoothingWindowFrames = config.speedSmoothingWindowFrames,
-                angleSmoothingWindowFrames = config.angleSmoothingWindowFrames,
-                swingCoordinateSmoothingWindowFrames = config.swingCoordinateSmoothingWindowFrames,
-                frontFrac = config.frontFrac,
-                backFrac = config.backFrac
-            )
-        )
         val swingsCsvFile = File(csvFile.parentFile, "swings_${csvFile.nameWithoutExtension}.csv")
         SwingCsvExporter.write(swingsCsvFile, motion, frames)
         val elapsedSeconds = (System.nanoTime() - startedAtNs) / NANOS_PER_SECOND
@@ -292,11 +288,34 @@ private data class VideoMetadata(
     val width: Int?,
     val height: Int?,
     val rotationDegrees: Int
+) {
+    /** Displayed height / width; normalised MediaPipe x and y use these two scales. */
+    fun displayAspect(): Float {
+        val w = width ?: return 16f / 9f
+        val h = height ?: return 16f / 9f
+        if (w <= 0 || h <= 0) return 16f / 9f
+        return if (rotationDegrees % 180 != 0) w.toFloat() / h else h.toFloat() / w
+    }
+}
+
+private fun AnalysisConfig.metricsConfig() = MetricsConfig(
+    visibilityThreshold = visibilityThreshold,
+    outlierMedianWindowFrames = outlierMedianWindowFrames,
+    outlierMedianDeviationTorsoLengths = outlierMedianDeviationTorsoLengths,
+    maxInterpolationGapFrames = maxInterpolationGapFrames,
+    speedSmoothingWindowFrames = speedSmoothingWindowFrames,
+    angleSmoothingWindowFrames = angleSmoothingWindowFrames,
+    swingCoordinateSmoothingWindowFrames = swingCoordinateSmoothingWindowFrames,
+    frontFrac = frontFrac,
+    backFrac = backFrac,
+    inPositionTorsoTolerance = inPositionTorsoTolerance,
+    minInPositionSeconds = minInPositionSeconds,
+    minSwingSpeedFraction = minSwingSpeedFraction
 )
 
 /** Sidecar data makes a raw landmark CSV reproducible outside the app. */
 private object AnalysisMetadataExporter {
-    fun write(file: File, video: VideoMetadata, config: AnalysisConfig) {
+    fun write(file: File, video: VideoMetadata, config: AnalysisConfig, view: ViewEstimate) {
         file.writeText(
             """
             {
@@ -306,6 +325,23 @@ private object AnalysisMetadataExporter {
                 "rotation_degrees": ${video.rotationDegrees}
               },
               "pose_model": "${config.modelVariant.name.lowercase()}",
+              "camera": "${config.recordingMetadata.camera.wireValue}",
+              "recording_angle": "${config.recordingMetadata.recordingAngle.wireValue}",
+              "phone_side": "${config.recordingMetadata.phoneSide.wireValue}",
+              "leading_hand": "${config.recordingMetadata.leadingHand?.name?.lowercase() ?: "unspecified"}",
+              "expected_swings": ${config.recordingMetadata.expectedSwings.jsonNumber()},
+              "manual_counts": {
+                "with_pauses": ${config.recordingMetadata.manualPausedSwings.jsonNumber()},
+                "continuous": ${config.recordingMetadata.manualSeriesSwings.jsonNumber()}
+              },
+              "detected_view": {
+                "view": "${view.view.wireValue}",
+                "camera_side": "${view.cameraSide.wireValue}",
+                "hip_yaw_degrees": ${view.hipYawDegrees.jsonNumber()},
+                "shoulder_yaw_degrees": ${view.shoulderYawDegrees.jsonNumber()},
+                "image_shoulder_width_to_torso": ${view.imageShoulderWidthToTorso.jsonNumber()},
+                "rest_frames": ${view.restFrames}
+              },
               "config": {
                 "visibility_threshold": ${config.visibilityThreshold},
                 "outlier_median_window_frames": ${config.outlierMedianWindowFrames},
@@ -316,8 +352,10 @@ private object AnalysisMetadataExporter {
                 "swing_coordinate_smoothing_window_frames": ${config.swingCoordinateSmoothingWindowFrames},
                 "front_frac": ${config.frontFrac},
                 "back_frac": ${config.backFrac},
-                "leading_hand": "${config.leadingHand.name.lowercase()}",
-                "recording_angle": "${config.recordingAngle.name.lowercase()}"
+                "in_position_torso_tolerance": ${config.inPositionTorsoTolerance},
+                "min_in_position_seconds": ${config.minInPositionSeconds},
+                "min_swing_speed_fraction": ${config.minSwingSpeedFraction},
+                "leading_hand": "${config.recordingMetadata.leadingHand?.name?.lowercase() ?: "unspecified"}"
               }
             }
             """.trimIndent()
@@ -325,6 +363,7 @@ private object AnalysisMetadataExporter {
     }
 
     private fun Int?.jsonNumber(): String = this?.toString() ?: "null"
+    private fun Float?.jsonNumber(): String = this?.let { "%.2f".format(java.util.Locale.US, it) } ?: "null"
 }
 
 /** CSV is intentionally flat so it can be opened directly in a spreadsheet. */

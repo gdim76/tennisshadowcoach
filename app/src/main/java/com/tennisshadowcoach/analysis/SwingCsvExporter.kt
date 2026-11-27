@@ -25,21 +25,31 @@ object SwingCsvExporter {
                         seconds(frames, segment.peakFrame),
                         seconds(frames, segment.endFrame),
                         number(segment.durationMs / 1_000f),
-                        (!segment.truncated).toString(),
-                        number(metrics?.leadingKnee?.atPeak),
+                        segment.counted.toString(),
+                        number(metrics?.leadingKnee?.atImpact),
+                        number(metrics?.leadingKnee?.atCoordinatePeak),
                         number(metrics?.leadingKnee?.min),
                         number(metrics?.leadingKnee?.max),
-                        number(metrics?.leadingElbow?.atPeak),
+                        number(metrics?.leadingElbow?.atImpact),
+                        number(metrics?.leadingElbow?.atCoordinatePeak),
                         number(metrics?.leadingElbow?.min),
                         number(metrics?.leadingElbow?.max),
-                        number(metrics?.trunkLean?.atPeak),
+                        number(metrics?.trunkLean?.atImpact),
+                        number(metrics?.trunkLean?.atCoordinatePeak),
                         number(metrics?.trunkLean?.max),
-                        segment.peakSpeedFrame?.let { seconds(frames, it) }.orEmpty(),
-                        metrics?.unreliableMetricLabels?.joinToString(";", transform = ::csvText).orEmpty()
+                        segment.impactFrame?.let { seconds(frames, it) }.orEmpty(),
+                        metrics?.unreliableMetricLabels?.joinToString(";", transform = ::csvText).orEmpty(),
+                        exclusionReason(segment)
                     ).joinToString(",")
                 )
             }
         }.joinToString("\n", postfix = "\n")
+    }
+
+    private fun exclusionReason(segment: SwingSegment): String = when {
+        segment.truncated -> "обрезан записью или подготовкой"
+        segment.tooSlow -> "медленное движение, не замах"
+        else -> ""
     }
 
     private fun SwingSegment.key() = Triple(startFrame, peakFrame, endFrame)
@@ -49,9 +59,9 @@ object SwingCsvExporter {
     private fun csvText(value: String): String = value.replace(',', ';')
 
     private const val HEADER =
-        "номер_замаха,начало_с,пик_координаты_с,конец_с,длительность_с,полный_ли_замах," +
-            "колено_в_пик_град,колено_мин_град,колено_макс_град," +
-            "локоть_в_пик_град,локоть_мин_град,локоть_макс_град," +
-            "наклон_корпуса_в_пик_град,наклон_корпуса_макс_град," +
-            "время_максимальной_скорости_запястья_с,ненадёжные_метрики"
+        "номер_замаха,начало_с,пик_координаты_с,конец_с,длительность_с,засчитан," +
+            "колено_в_момент_удара_град,колено_в_пике_координаты_град,колено_мин_град,колено_макс_град," +
+            "локоть_в_момент_удара_град,локоть_в_пике_координаты_град,локоть_мин_град,локоть_макс_град," +
+            "наклон_корпуса_в_момент_удара_град_3d_от_вертикали_без_знака,наклон_корпуса_в_пике_координаты_град_3d_от_вертикали_без_знака,наклон_корпуса_макс_град_3d_от_вертикали_без_знака," +
+            "время_момента_удара_с,ненадёжные_метрики,не_засчитан_причина"
 }

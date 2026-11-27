@@ -44,7 +44,10 @@ class CoachSettingsStore(context: Context) {
             val rule = ruleObject?.let {
                 FocusRule(
                     metric = runCatching { FocusMetric.valueOf(it.getString("metric")) }.getOrDefault(FocusMetric.LEADING_KNEE),
-                    phase = runCatching { SwingPhase.valueOf(it.getString("phase")) }.getOrDefault(SwingPhase.PEAK_SPEED),
+                    phase = it.optString("phase").let { name ->
+                        if (name == "PEAK_SPEED") SwingPhase.IMPACT
+                        else runCatching { SwingPhase.valueOf(name) }.getOrDefault(SwingPhase.IMPACT)
+                    },
                     minimum = it.optDoubleOrNull("minimum"),
                     maximum = it.optDoubleOrNull("maximum"),
                     hint = it.optString("hint")
