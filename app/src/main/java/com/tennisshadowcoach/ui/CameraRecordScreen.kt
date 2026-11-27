@@ -15,6 +15,8 @@ import androidx.camera.video.Recorder
 import androidx.camera.video.VideoCapture
 import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.PreviewView
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -26,7 +28,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
-import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.FiberManualRecord
 import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
@@ -37,34 +38,48 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.tennisshadowcoach.analysis.CaptureCamera
+import com.tennisshadowcoach.analysis.RecordingMetadata
 import java.io.File
 
 @Composable
 fun CameraRecordScreen(
+    metadata: RecordingMetadata,
+    onMetadataChange: (RecordingMetadata) -> Unit,
     onBack: () -> Unit,
-    onVideoSaved: (Uri, String?) -> Unit
+    onVideoSaved: (Uri, String?, RecordingMetadata) -> Unit
 ) {
     val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
+    val view = LocalView.current
     val mainExecutor = remember(context) { ContextCompat.getMainExecutor(context) }
-    var lensFacing by remember { mutableIntStateOf(CameraSelector.LENS_FACING_BACK) }
     var videoCapture by remember { mutableStateOf<VideoCapture<Recorder>?>(null) }
     var recording by remember { mutableStateOf<androidx.camera.video.Recording?>(null) }
     var recordingNow by remember { mutableStateOf(false) }
     var cameraError by remember { mutableStateOf<String?>(null) }
 
+    // A timed display lock must never stop a recording before the user can press Stop.
+    // Restore the activity's previous preference as soon as this screen leaves composition.
+    DisposableEffect(view) {
+        val wasKeepingScreenOn = view.keepScreenOn
+        view.keepScreenOn = true
+        onDispose { view.keepScreenOn = wasKeepingScreenOn }
+    }
+
     Column(
-        Modifier.fillMaxSize().padding(16.dp),
+        Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -74,31 +89,19 @@ fun CameraRecordScreen(
             Column(Modifier.weight(1f)) {
                 Text("Запись упражнения", style = MaterialTheme.typography.titleLarge)
                 Text(
-                    if (lensFacing == CameraSelector.LENS_FACING_BACK) "Тыловая камера · целевой режим 30 кадров/с"
-                    else "Фронтальная камера · целевой режим 30 кадров/с",
+                    "Сначала явно укажи условия записи. Целевой режим — 30 кадров/с.",
                     style = MaterialTheme.typography.bodySmall
                 )
             }
-            IconButton(
-                enabled = !recordingNow,
-                onClick = {
-                    lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK) {
-                        CameraSelector.LENS_FACING_FRONT
-                    } else {
-                        CameraSelector.LENS_FACING_BACK
-                    }
-                }
-            ) {
-                Icon(Icons.Default.Cameraswitch, contentDescription = "Сменить камеру")
-            }
         }
 
-        CameraPreview(
-            lensFacing = lensFacing,
-            onCaptureReady = { videoCapture = it },
-            onError = { cameraError = it }
-        )
+        RecordingMetadataEditor(metadata, onMetadataChange)
 
+        val lensFacing = when (metadata.camera) {
+            CaptureCamera.REAR -> CameraSelector.LENS_FACING_BACK
+            CaptureCamera.SELFIE -> CameraSelector.LENS_FACING_FRONT
+            CaptureCamera.UNSPECIFIED -> null
+        }
         cameraError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
 
         Text(
@@ -108,7 +111,7 @@ fun CameraRecordScreen(
 
         Button(
             modifier = Modifier.fillMaxWidth(),
-            enabled = videoCapture != null,
+            enabled = videoCapture != null && lensFacing != null,
             onClick = {
                 val capture = videoCapture ?: return@Button
                 if (recordingNow) {
@@ -145,13 +148,14 @@ fun CameraRecordScreen(
                                         if (outputFile.isReadableVideo()) {
                                             onVideoSaved(
                                                 Uri.fromFile(outputFile),
-                                                "Камера завершила запись: $reason. Видеофайл сохранён и доступен для анализа."
+                                                "Камера завершила запись: $reason. Видеофайл сохранён и доступен для анализа.",
+                                                metadata
                                             )
                                         } else {
                                             cameraError = "Запись не сохранена: $reason"
                                         }
                                     } else {
-                                        onVideoSaved(Uri.fromFile(outputFile), null)
+                                        onVideoSaved(Uri.fromFile(outputFile), null, metadata)
                                     }
                                 }
                             }
@@ -162,6 +166,17 @@ fun CameraRecordScreen(
             Icon(Icons.Default.FiberManualRecord, contentDescription = null)
             Spacer(Modifier.width(8.dp))
             Text(if (recordingNow) "Остановить запись" else "Начать запись")
+        }
+
+        if (lensFacing == null) {
+            Text("Выбери камеру: иначе запись не начнётся, а metadata останется unspecified.")
+        } else {
+            Text("Предпросмотр камеры", style = MaterialTheme.typography.bodySmall)
+            CameraPreview(
+                lensFacing = lensFacing,
+                onCaptureReady = { videoCapture = it },
+                onError = { cameraError = it }
+            )
         }
     }
 

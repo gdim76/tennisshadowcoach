@@ -9,7 +9,7 @@ enum class MetricId(val label: String, val requiredAngle: RecordingAngle?) {
     LEFT_KNEE("Левое колено", RecordingAngle.SIDE),
     RIGHT_KNEE("Правое колено", RecordingAngle.SIDE),
     LEADING_ELBOW("Локоть ведущей руки", RecordingAngle.SIDE),
-    TRUNK_LEAN("Наклон корпуса", RecordingAngle.SIDE),
+    TRUNK_LEAN("Наклон корпуса (3D, от вертикали, без знака)", null),
     SHOULDER_HIP_ROTATION("Разворот плеч относительно таза", RecordingAngle.FRONT_OR_45),
     STANCE_WIDTH("Ширина стойки", RecordingAngle.FRONT_OR_45),
     WRIST_SPEED("Скорость ведущего запястья", null)
@@ -49,8 +49,9 @@ data class SwingSegment(
     val peakFrame: Int,
     val endFrame: Int,
     val startTimestampUs: Long,
-    val peakSpeed: Float?,
-    val peakSpeedFrame: Int?,
+    /** Maximum positive derivative of the swing coordinate before its coordinate peak. */
+    val impactCoordinateSpeed: Float?,
+    val impactFrame: Int?,
     val durationMs: Long,
     val truncated: Boolean = false
 )
@@ -71,7 +72,8 @@ data class SwingMetrics(
 /** Values are in degrees.  A value is omitted rather than guessed when raw evidence is weak. */
 data class MetricSummary(
     val label: String,
-    val atPeak: Float?,
+    val atImpact: Float?,
+    val atCoordinatePeak: Float?,
     val min: Float?,
     val max: Float?,
     val validFrameFraction: Float,
@@ -126,7 +128,7 @@ object MotionMetricsEngine {
             frames.indices.count { rawMetricIsValid(frames[it], metric, leadingHand, recordingAngle, config) }
                 .toFloat() / frames.size
         }
-        val segmentation = segmentSwings(frames, leadingHand, wristSpeed, config)
+        val segmentation = segmentSwings(frames, leadingHand, config)
         val swingMetrics = segmentation.complete.map { segment ->
             SwingMetrics(
                 segment = segment,
@@ -166,7 +168,8 @@ object MotionMetricsEngine {
         val available = metric.requiredAngle == null || metric.requiredAngle == angle
         if (!available) return MetricSummary(
             label = metric.label,
-            atPeak = null,
+            atImpact = null,
+            atCoordinatePeak = null,
             min = null,
             max = null,
             validFrameFraction = 0f,
@@ -179,16 +182,30 @@ object MotionMetricsEngine {
         }.toFloat() / range.count()
         val reliable = validFraction >= config.reliableFrameFraction
         val values = range.mapNotNull { index -> smoothedFrames[index].readings[metric]?.world3d }
-        val atPeak = segment.peakSpeedFrame?.let { smoothedFrames.getOrNull(it)?.readings?.get(metric)?.world3d }
+        val atImpact = when (metric) {
+            MetricId.LEADING_ELBOW -> averageAroundImpact(smoothedFrames, segment, metric)
+            else -> segment.impactFrame?.let { smoothedFrames.getOrNull(it)?.readings?.get(metric)?.world3d }
+        }
+        val atCoordinatePeak = smoothedFrames.getOrNull(segment.peakFrame)?.readings?.get(metric)?.world3d
         return MetricSummary(
             label = metric.label,
-            atPeak = atPeak.takeIf { reliable },
+            atImpact = atImpact.takeIf { reliable },
+            atCoordinatePeak = atCoordinatePeak.takeIf { reliable },
             min = values.minOrNull().takeIf { reliable },
             max = values.maxOrNull().takeIf { reliable },
             validFrameFraction = validFraction,
             reliable = reliable,
             available = true
         )
+    }
+
+    /** The elbow is averaged over five frames around impact to suppress a single unstable frame. */
+    private fun averageAroundImpact(frames: List<FrameMetrics>, segment: SwingSegment, metric: MetricId): Float? {
+        val impact = segment.impactFrame ?: return null
+        val values = ((impact - 2)..(impact + 2))
+            .filter { it in segment.startFrame..segment.endFrame }
+            .mapNotNull { frames.getOrNull(it)?.readings?.get(metric)?.world3d }
+        return values.takeIf { it.size >= 3 }?.average()?.toFloat()
     }
 
     private fun rawMetricIsValid(
@@ -236,7 +253,8 @@ object MotionMetricsEngine {
                 angle(image[leadingShoulder], image[leadingElbow], image[leadingWrist]),
                 side
             ),
-            MetricId.TRUNK_LEAN to reading(worldTrunkLean(world), imageTrunkLean(image), side),
+            // The reported metric is world-3D.  The image-plane value is debug-only.
+            MetricId.TRUNK_LEAN to reading(worldTrunkLean(world), imageTrunkLean(image), true),
             MetricId.SHOULDER_HIP_ROTATION to reading(shoulderHipRotation(world), null, front),
             MetricId.STANCE_WIDTH to reading(worldStanceWidth(world), imageStanceWidth(image), front),
             MetricId.WRIST_SPEED to MetricReading(wristSpeed, null)
@@ -271,11 +289,14 @@ object MotionMetricsEngine {
         val upper: Float?
     )
 
+    private data class SwingCoordinates(
+        val segmentation: List<Float?>,
+        /** Savitzky–Golay derivative, matching impact_moment() in the Python reference. */
+        val impactDerivative: List<Float?>
+    )
+
     /** Direct Kotlin port of data/swing_segmentation_reference.py. */
-    private fun segmentSwings(
-        frames: List<PoseFrame>, hand: LeadingHand,
-        speed: List<Float?>, config: MetricsConfig
-    ): Segmentation {
+    private fun segmentSwings(frames: List<PoseFrame>, hand: LeadingHand, config: MetricsConfig): Segmentation {
         val wrist = if (hand == LeadingHand.RIGHT) 16 else 15
         val torso = medianTorsoLength(frames.map { it.worldLandmarks }) ?: return Segmentation(emptyList(), emptyList(), List(frames.size) { null }, null, null)
         // MediaPipe world coordinates are hip-centred in the usual case; subtracting the
@@ -285,7 +306,8 @@ object MotionMetricsEngine {
         }
         val visible = frames.map { frame -> (frame.landmarks.getOrNull(wrist)?.visibility ?: 0f) >= config.visibilityThreshold }
         val points = cleanReferenceTrack(raw, visible, config)
-        val coordinate = swingCoordinate(points, config)
+        val coordinates = swingCoordinates(points, config)
+        val coordinate = coordinates.segmentation
         val good = coordinate.filterNotNull()
         if (good.isEmpty()) return Segmentation(emptyList(), emptyList(), coordinate, null, null)
         val lo = percentile(good, .05f)
@@ -312,30 +334,40 @@ object MotionMetricsEngine {
                 if (value > held[peak]) peak = index
                 if (value < back) {
                     if ((index - start) / config.segmentationFps >= config.minSwingDurationSeconds) {
-                        all += makeSegment(frames, speed, start, peak, index, truncated = false)
+                        all += makeSegment(frames, coordinates.impactDerivative, start, peak, index, truncated = false)
                     }
                     state = 0
                 }
             }
         }
         if (state == 1 && (frames.lastIndex - start) / config.segmentationFps >= config.minSwingDurationSeconds) {
-            all += makeSegment(frames, speed, start, peak, frames.lastIndex, truncated = false)
+            all += makeSegment(frames, coordinates.impactDerivative, start, peak, frames.lastIndex, truncated = false)
         }
         val tailFrames = (config.trailingPeakExclusionSeconds * config.segmentationFps).toInt()
         val tagged = all.map { segment -> segment.copy(truncated = segment.startFrame == 0 || segment.peakFrame >= frames.size - 1 - tailFrames) }
         return Segmentation(tagged.filterNot { it.truncated }, tagged, coordinate, back, front)
     }
 
-    private fun makeSegment(frames: List<PoseFrame>, speed: List<Float?>, start: Int, peak: Int, end: Int, truncated: Boolean): SwingSegment {
-        val speedFrame = (start..end).filter { speed[it] != null }.maxByOrNull { speed[it]!! }
+    private fun makeSegment(
+        frames: List<PoseFrame>, impactDerivative: List<Float?>,
+        start: Int, peak: Int, end: Int, truncated: Boolean
+    ): SwingSegment {
+        val impact = maximumCoordinateDerivative(frames, impactDerivative, start, peak)
         return SwingSegment(
             startFrame = start, peakFrame = peak, endFrame = end,
             startTimestampUs = frames[start].timestampUs,
-            peakSpeed = speedFrame?.let { speed[it] }, peakSpeedFrame = speedFrame,
+            impactCoordinateSpeed = impact?.second, impactFrame = impact?.first,
             durationMs = (frames[end].timestampUs - frames[start].timestampUs) / 1_000L,
             truncated = truncated
         )
     }
+
+    /** Same choice as impact_moment(): maximum SG derivative from start through coordinate peak. */
+    private fun maximumCoordinateDerivative(
+        frames: List<PoseFrame>, derivative: List<Float?>, start: Int, peak: Int
+    ): Pair<Int, Float>? = (start..peak)
+        .mapNotNull { index -> derivative.getOrNull(index)?.let { index to it } }
+        .maxByOrNull { it.second }
 
     private fun cleanImageTracks(frames: List<PoseFrame>, config: MetricsConfig): List<List<ImageLandmark?>> {
         val scale = medianImageTorsoLength(frames)?.takeIf { it > EPSILON } ?: 1f
@@ -390,11 +422,19 @@ object MotionMetricsEngine {
     }
 
     private fun imageTrunkLean(points: List<ImageLandmark?>): Float? = trunkLean(points[11]?.toVec(), points[12]?.toVec(), points[23]?.toVec(), points[24]?.toVec())
-    private fun worldTrunkLean(points: List<WorldLandmark?>): Float? = trunkLean(points[11]?.toVec(), points[12]?.toVec(), points[23]?.toVec(), points[24]?.toVec())
+    private fun worldTrunkLean(points: List<WorldLandmark?>): Float? = trunkLean3d(points[11]?.toVec(), points[12]?.toVec(), points[23]?.toVec(), points[24]?.toVec())
     private fun trunkLean(ls: Vec3?, rs: Vec3?, lh: Vec3?, rh: Vec3?): Float? {
         val shoulder = midpoint(ls, rs) ?: return null; val hip = midpoint(lh, rh) ?: return null
         val delta = shoulder - hip
         return Math.toDegrees(atan2(abs(delta.x).toDouble(), abs(delta.y).toDouble())).toFloat()
+    }
+    /** Reference trunk_lean_3d: unsigned angle of hips-to-shoulders against world vertical y. */
+    private fun trunkLean3d(ls: Vec3?, rs: Vec3?, lh: Vec3?, rh: Vec3?): Float? {
+        val shoulder = midpoint(ls, rs) ?: return null; val hip = midpoint(lh, rh) ?: return null
+        val delta = shoulder - hip
+        val length = delta.length()
+        if (length <= EPSILON) return null
+        return Math.toDegrees(acos((abs(delta.y) / length).coerceIn(0f, 1f).toDouble())).toFloat()
     }
     private fun shoulderHipRotation(p: List<WorldLandmark?>): Float? =
         angleBetweenLines(p[11]?.toVec(), p[12]?.toVec(), p[24]?.toVec(), p[23]?.toVec())
@@ -440,16 +480,29 @@ object MotionMetricsEngine {
         }
     }
 
-    private fun swingCoordinate(points: List<Vec3?>, config: MetricsConfig): List<Float?> {
+    /**
+     * The segmentation coordinate uses its configured long window.  Impact timing uses the
+     * identical projection, but a separate 5–7 frame Savitzky–Golay derivative.
+     */
+    private fun swingCoordinates(points: List<Vec3?>, config: MetricsConfig): SwingCoordinates {
         val valid = points.filterNotNull()
-        if (valid.size < 3) return List(points.size) { null }
+        if (valid.size < 3) return SwingCoordinates(List(points.size) { null }, List(points.size) { null })
         val mean = meanVec(valid)
-        val axis = principalAxis(valid.map { it - mean }) ?: return List(points.size) { null }
+        val axis = principalAxis(valid.map { it - mean })
+            ?: return SwingCoordinates(List(points.size) { null }, List(points.size) { null })
         val raw = points.map { point -> point?.minus(mean)?.dot(axis) }
-        val filled = interpolateAll(raw) ?: return raw
-        val smoothed = savitzkyGolayReference(filled, config.swingCoordinateSmoothingWindowFrames)
-        val restored = raw.indices.map { index -> smoothed[index].takeIf { raw[index] != null } }
-        return if (skew(restored.filterNotNull()) < 0f) restored.map { it?.unaryMinus() } else restored
+        val filled = interpolateAll(raw) ?: return SwingCoordinates(raw, raw)
+        val segmentationSmoothed = savitzkyGolayReference(filled, config.swingCoordinateSmoothingWindowFrames)
+        val impactDerivative = savitzkyGolayDerivativeReference(
+            filled,
+            config.speedSmoothingWindowFrames.coerceIn(5, 7),
+            config.segmentationFps
+        )
+        val segmentation = raw.indices.map { index -> segmentationSmoothed[index].takeIf { raw[index] != null } }
+        val impact = raw.indices.map { index -> impactDerivative[index].takeIf { raw[index] != null } }
+        return if (skew(segmentation.filterNotNull()) < 0f) {
+            SwingCoordinates(segmentation.map { it?.unaryMinus() }, impact.map { it?.unaryMinus() })
+        } else SwingCoordinates(segmentation, impact)
     }
 
     private fun savitzkyGolayReference(values: List<Float>, requestedWindow: Int): List<Float> {
@@ -463,6 +516,22 @@ object MotionMetricsEngine {
                 else -> index - radius..index + radius
             }
             polynomialAt(range.map { it - index to values[it] }, 2)
+        }
+    }
+
+    /** scipy.signal.savgol_filter(values, window, 2, deriv=1, delta=1/fps) for this small fixed degree. */
+    private fun savitzkyGolayDerivativeReference(values: List<Float>, requestedWindow: Int, fps: Float): List<Float> {
+        val window = requestedWindow.coerceAtLeast(3).let { if (it % 2 == 0) it + 1 else it }
+            .coerceAtMost(values.size.let { if (it % 2 == 0) it - 1 else it })
+        if (window < 3 || fps <= 0f) return List(values.size) { 0f }
+        val radius = window / 2
+        return values.indices.map { index ->
+            val range = when {
+                index < radius -> 0 until window
+                index >= values.size - radius -> values.size - window until values.size
+                else -> index - radius..index + radius
+            }
+            polynomialDerivativeAt(range.map { it - index to values[it] }, 2) * fps
         }
     }
 
@@ -508,6 +577,35 @@ object MotionMetricsEngine {
             }
         }
         return rhs[0]
+    }
+
+    private fun polynomialDerivativeAt(samples: List<Pair<Int, Float>>, degree: Int): Float {
+        val n = degree + 1
+        val matrix = Array(n) { FloatArray(n) }
+        val rhs = FloatArray(n)
+        samples.forEach { (x, y) ->
+            for (row in 0 until n) {
+                val xr = x.toFloat().pow(row)
+                rhs[row] += xr * y
+                for (column in 0 until n) matrix[row][column] += xr * x.toFloat().pow(column)
+            }
+        }
+        for (pivot in 0 until n) {
+            var best = pivot
+            for (row in pivot + 1 until n) if (abs(matrix[row][pivot]) > abs(matrix[best][pivot])) best = row
+            if (abs(matrix[best][pivot]) <= EPSILON) return 0f
+            val swap = matrix[pivot]; matrix[pivot] = matrix[best]; matrix[best] = swap
+            val value = rhs[pivot]; rhs[pivot] = rhs[best]; rhs[best] = value
+            val diagonal = matrix[pivot][pivot]
+            for (column in pivot until n) matrix[pivot][column] /= diagonal
+            rhs[pivot] /= diagonal
+            for (row in 0 until n) if (row != pivot) {
+                val factor = matrix[row][pivot]
+                for (column in pivot until n) matrix[row][column] -= factor * matrix[pivot][column]
+                rhs[row] -= factor * rhs[pivot]
+            }
+        }
+        return rhs.getOrElse(1) { 0f }
     }
 
     private fun <T> maskMedianOutliers(values: List<T?>, scale: Float, config: MetricsConfig, toVec: (T) -> Vec3): List<T?> {

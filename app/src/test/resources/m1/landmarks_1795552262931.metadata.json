@@ -1,5 +1,7 @@
 {
-  "expected_swings": 8,
+  "camera": "rear",
+  "recording_angle": "angle_45",
+  "phone_side": "unspecified",
   "leading_hand": "right",
-  "recording_angle": "side"
+  "expected_swings": 8
 }

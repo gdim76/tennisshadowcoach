@@ -46,8 +46,10 @@ import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import com.tennisshadowcoach.analysis.AnalysisProgress
 import com.tennisshadowcoach.analysis.AnalysisConfig
+import com.tennisshadowcoach.analysis.CaptureRecordingAngle
 import com.tennisshadowcoach.analysis.LeadingHand
 import com.tennisshadowcoach.analysis.RecordingAngle
+import com.tennisshadowcoach.analysis.RecordingMetadata
 import com.tennisshadowcoach.analysis.VideoAnalysis
 import com.tennisshadowcoach.analysis.VideoPoseAnalyzer
 import com.tennisshadowcoach.coach.CoachSettingsStore
@@ -70,10 +72,11 @@ fun TennisCoachApp() {
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var recordingNotice by remember { mutableStateOf<String?>(null) }
     var showCamera by remember { mutableStateOf(false) }
+    var showLiveMirror by remember { mutableStateOf(false) }
+    var openLiveAfterPermission by remember { mutableStateOf(false) }
     var showDebug by remember { mutableStateOf(false) }
     var showCoachSession by remember { mutableStateOf(false) }
-    var leadingHand by remember { mutableStateOf(LeadingHand.RIGHT) }
-    var recordingAngle by remember { mutableStateOf(RecordingAngle.SIDE) }
+    var recordingMetadata by remember { mutableStateOf(RecordingMetadata()) }
     val latestRecording = remember(context) { findLatestRecording(context) }
     val coachStore = remember(context) { CoachSettingsStore(context) }
     var coachDraft by remember { mutableStateOf(coachStore.load()) }
@@ -81,15 +84,21 @@ fun TennisCoachApp() {
     val cameraPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
-        if (granted) showCamera = true
+        if (granted && openLiveAfterPermission) {
+            openLiveAfterPermission = false
+            showLiveMirror = true
+        } else if (granted) showCamera = true
         else errorMessage = "Для записи видео нужен доступ к камере."
     }
 
     if (showCamera) {
         CameraRecordScreen(
+            metadata = recordingMetadata,
+            onMetadataChange = { recordingMetadata = it },
             onBack = { showCamera = false },
-            onVideoSaved = { uri, notice ->
+            onVideoSaved = { uri, notice, metadata ->
                 videoUri = uri
+                recordingMetadata = metadata
                 analysis = null
                 progress = null
                 recordingNotice = notice
@@ -97,6 +106,15 @@ fun TennisCoachApp() {
             }
         )
         return
+    }
+
+    if (showLiveMirror) {
+        val hand = recordingMetadata.leadingHand
+        if (hand != null) {
+            LiveMirrorScreen(leadingHand = hand, onBack = { showLiveMirror = false })
+            return
+        }
+        showLiveMirror = false
     }
 
     if (showDebug && analysis != null) {
@@ -154,17 +172,9 @@ fun TennisCoachApp() {
 
             Card {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("Параметры M1", style = MaterialTheme.typography.titleMedium)
-                    Text("Ведущая рука", style = MaterialTheme.typography.bodySmall)
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        FilterChip(leadingHand == LeadingHand.RIGHT, { leadingHand = LeadingHand.RIGHT }, label = { Text("Правая") })
-                        FilterChip(leadingHand == LeadingHand.LEFT, { leadingHand = LeadingHand.LEFT }, label = { Text("Левая") })
-                    }
-                    Text("Ракурс", style = MaterialTheme.typography.bodySmall)
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        FilterChip(recordingAngle == RecordingAngle.SIDE, { recordingAngle = RecordingAngle.SIDE }, label = { Text("Сбоку") })
-                        FilterChip(recordingAngle == RecordingAngle.FRONT_OR_45, { recordingAngle = RecordingAngle.FRONT_OR_45 }, label = { Text("Спереди / 45°") })
-                    }
+                    Text("Метаданные записи", style = MaterialTheme.typography.titleMedium)
+                    Text("Не выбранные поля сохраняются как unspecified — приложение не подставляет ракурс или сторону молча.")
+                    RecordingMetadataEditor(recordingMetadata, { recordingMetadata = it })
                 }
             }
 
@@ -181,6 +191,24 @@ fun TennisCoachApp() {
                 Text("Записать тренировку")
             }
 
+            Button(
+                enabled = recordingMetadata.leadingHand != null,
+                onClick = {
+                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
+                        PackageManager.PERMISSION_GRANTED
+                    ) {
+                        showLiveMirror = true
+                    } else {
+                        openLiveAfterPermission = true
+                        cameraPermission.launch(Manifest.permission.CAMERA)
+                    }
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("Открыть зеркало (подготовка M3)") }
+            if (recordingMetadata.leadingHand == null) {
+                Text("Для зеркала сначала выбери ведущую руку в метаданных.", style = MaterialTheme.typography.bodySmall)
+            }
+
             if (videoUri == null && latestRecording != null) {
                 Button(
                     onClick = { videoUri = Uri.fromFile(latestRecording) },
@@ -189,6 +217,12 @@ fun TennisCoachApp() {
             }
 
             videoUri?.let { selectedVideo ->
+                val hand = recordingMetadata.leadingHand
+                val analysisAngle = when (recordingMetadata.recordingAngle) {
+                    CaptureRecordingAngle.SIDE -> RecordingAngle.SIDE
+                    CaptureRecordingAngle.FRONT, CaptureRecordingAngle.ANGLE_45 -> RecordingAngle.FRONT_OR_45
+                    CaptureRecordingAngle.UNSPECIFIED -> null
+                }
                 Card {
                     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -201,8 +235,14 @@ fun TennisCoachApp() {
                             Text("Видео готово к анализу", fontWeight = FontWeight.SemiBold)
                         }
                         Text("Будет обработан каждый кадр видеодорожки с его исходной временной меткой.")
+                        if (hand == null || analysisAngle == null) {
+                            Text(
+                                "Для разбора выбери ведущую руку и ракурс выше. До выбора metadata останется unspecified.",
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        }
                         Button(
-                            enabled = !analyzing,
+                            enabled = !analyzing && hand != null && analysisAngle != null,
                             onClick = {
                                 analyzing = true
                                 progress = null
@@ -213,7 +253,11 @@ fun TennisCoachApp() {
                                         analysis = withContext(Dispatchers.IO) {
                                             VideoPoseAnalyzer(
                                                 context,
-                                                AnalysisConfig(leadingHand = leadingHand, recordingAngle = recordingAngle)
+                                                AnalysisConfig(
+                                                    leadingHand = hand ?: LeadingHand.RIGHT,
+                                                    recordingAngle = analysisAngle ?: RecordingAngle.SIDE,
+                                                    recordingMetadata = recordingMetadata
+                                                )
                                             ).analyze(selectedVideo) { update -> progress = update }
                                         }
                                     } catch (error: Throwable) {
@@ -285,7 +329,7 @@ private fun AnalysisResultCard(
             MetricRow("Найдено замахов", analysis.motion.swings.size.toString())
             analysis.motion.swings.forEachIndexed { index, swing ->
                 Text(
-                    "Замах ${index + 1}: ${swing.durationMs} мс · пик ${"%.2f".format(swing.peakSpeed)} торса/с",
+                    "Замах ${index + 1}: ${swing.durationMs} мс · момент удара ${swing.impactFrame?.let { "кадр $it" } ?: "не найден"}",
                     style = MaterialTheme.typography.bodySmall
                 )
             }

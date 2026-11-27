@@ -7,11 +7,12 @@ import com.tennisshadowcoach.analysis.SwingMetrics
 enum class FocusMetric(val label: String) {
     LEADING_KNEE("Колено ведущей стороны"),
     LEADING_ELBOW("Локоть ведущей руки"),
-    TRUNK_LEAN("Наклон корпуса")
+    TRUNK_LEAN("Наклон корпуса (3D, от вертикали, без знака)")
 }
 
 enum class SwingPhase(val label: String) {
-    PEAK_SPEED("момент максимальной скорости"),
+    IMPACT("момент удара"),
+    COORDINATE_PEAK("пик координаты"),
     MIN_IN_SWING("минимум за замах"),
     MAX_IN_SWING("максимум за замах")
 }
@@ -62,7 +63,8 @@ object FocusRuleEvaluator {
     }
 
     private fun MetricSummary.valueAt(phase: SwingPhase): Float? = when (phase) {
-        SwingPhase.PEAK_SPEED -> atPeak
+        SwingPhase.IMPACT -> atImpact
+        SwingPhase.COORDINATE_PEAK -> atCoordinatePeak
         SwingPhase.MIN_IN_SWING -> min
         SwingPhase.MAX_IN_SWING -> max
     }

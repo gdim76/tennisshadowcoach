@@ -1,0 +1,30 @@
+{
+  "video": {
+    "width": 1280,
+    "height": 720,
+    "rotation_degrees": 270
+  },
+  "pose_model": "lite",
+  "camera": "selfie",
+  "recording_angle": "angle_45",
+  "phone_side": "unspecified",
+  "leading_hand": "right",
+  "expected_swings": 9,
+  "manual_counts": {
+    "with_pauses": 4,
+    "continuous": 5
+  },
+  "config": {
+    "visibility_threshold": 0.5,
+    "outlier_median_window_frames": 7,
+    "outlier_median_deviation_torso_lengths": 0.35,
+    "max_interpolation_gap_frames": 6,
+    "speed_smoothing_window_frames": 5,
+    "angle_smoothing_window_frames": 9,
+    "swing_coordinate_smoothing_window_frames": 9,
+    "front_frac": 0.6,
+    "back_frac": 0.25,
+    "leading_hand": "right",
+    "recording_angle": "angle_45"
+  }
+}

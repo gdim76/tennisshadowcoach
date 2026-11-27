@@ -117,7 +117,7 @@ private fun FocusEditor(focus: WeeklyFocus, onChange: (WeeklyFocus) -> Unit, onR
                     checked = rule != null,
                     onCheckedChange = { enabled ->
                         onChange(focus.copy(rule = if (enabled) {
-                            FocusRule(FocusMetric.LEADING_KNEE, SwingPhase.PEAK_SPEED)
+                            FocusRule(FocusMetric.LEADING_KNEE, SwingPhase.IMPACT)
                         } else null))
                     }
                 )

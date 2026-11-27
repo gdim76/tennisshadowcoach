@@ -38,7 +38,8 @@ data class AnalysisConfig(
     val frontFrac: Float = 0.6f,
     val backFrac: Float = 0.25f,
     val leadingHand: LeadingHand = LeadingHand.RIGHT,
-    val recordingAngle: RecordingAngle = RecordingAngle.SIDE
+    val recordingAngle: RecordingAngle = RecordingAngle.SIDE,
+    val recordingMetadata: RecordingMetadata = RecordingMetadata()
 )
 
 data class AnalysisProgress(
@@ -306,6 +307,15 @@ private object AnalysisMetadataExporter {
                 "rotation_degrees": ${video.rotationDegrees}
               },
               "pose_model": "${config.modelVariant.name.lowercase()}",
+              "camera": "${config.recordingMetadata.camera.wireValue}",
+              "recording_angle": "${config.recordingMetadata.recordingAngle.wireValue}",
+              "phone_side": "${config.recordingMetadata.phoneSide.wireValue}",
+              "leading_hand": "${config.recordingMetadata.leadingHand?.name?.lowercase() ?: "unspecified"}",
+              "expected_swings": ${config.recordingMetadata.expectedSwings.jsonNumber()},
+              "manual_counts": {
+                "with_pauses": ${config.recordingMetadata.manualPausedSwings.jsonNumber()},
+                "continuous": ${config.recordingMetadata.manualSeriesSwings.jsonNumber()}
+              },
               "config": {
                 "visibility_threshold": ${config.visibilityThreshold},
                 "outlier_median_window_frames": ${config.outlierMedianWindowFrames},
@@ -316,8 +326,8 @@ private object AnalysisMetadataExporter {
                 "swing_coordinate_smoothing_window_frames": ${config.swingCoordinateSmoothingWindowFrames},
                 "front_frac": ${config.frontFrac},
                 "back_frac": ${config.backFrac},
-                "leading_hand": "${config.leadingHand.name.lowercase()}",
-                "recording_angle": "${config.recordingAngle.name.lowercase()}"
+                "leading_hand": "${config.recordingMetadata.leadingHand?.name?.lowercase() ?: "unspecified"}",
+                "recording_angle": "${config.recordingMetadata.recordingAngle.wireValue}"
               }
             }
             """.trimIndent()
