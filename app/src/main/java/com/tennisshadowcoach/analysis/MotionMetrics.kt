@@ -144,10 +144,11 @@ data class SwingSegment(
  * A technique correction for a counted swing: the app is a practice coach, so a wrong swing is
  * counted and told what to fix instead of being dropped.
  */
-enum class SwingCorrection(val title: String, val advice: String) {
+enum class SwingCorrection(val title: String, val advice: String, val spoken: String) {
     NO_SHOULDER_TURN(
         "Нет разворота плеч",
-        "Начни замах с разворота плеч и корпуса боком к сетке, а не только рукой."
+        "Начни замах с разворота плеч и корпуса боком к сетке, а не только рукой.",
+        "Нет замаха. Разверни плечи."
     )
 }
 

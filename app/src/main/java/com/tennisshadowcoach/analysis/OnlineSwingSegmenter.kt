@@ -100,6 +100,18 @@ class OnlineSwingSegmenter(
     fun detectedSwings(): List<DetectedSwing> = detected.toList()
 
     /**
+     * Starts a new practice set with the same calibration (thresholds, axis, speed reference):
+     * counts and windows go back to zero, an open window is dropped.
+     */
+    fun startNewSet() {
+        detected.clear()
+        liveCount = 0
+        openCounted = false
+        openChecked = false
+        state = REST
+    }
+
+    /**
      * Called when a live session stops.  It mirrors the offline trailing-peak rule: an open
      * window is countable only when its peak is at least 0.3 seconds before the final frame.
      */

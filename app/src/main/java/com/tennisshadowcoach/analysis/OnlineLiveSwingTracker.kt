@@ -115,6 +115,11 @@ class OnlineLiveSwingTracker(
 
     fun detectedSwings(): List<OnlineSwingSegmenter.DetectedSwing> = segmenter?.detectedSwings().orEmpty()
 
+    /** A new practice set with the current calibration; no effect before calibration. */
+    fun startNewSet() {
+        segmenter?.startNewSet()
+    }
+
     fun finish(): State {
         val update = segmenter?.finish() ?: return State(false, 0, false)
         return State(true, update.completedCount, update.completedSwing != null, inPosition)
