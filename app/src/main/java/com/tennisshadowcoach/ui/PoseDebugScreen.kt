@@ -203,7 +203,8 @@ private fun SwingCharts(debug: SwingDebugData, metrics: List<SwingMetrics>, modi
             metrics.forEachIndexed { index, swing ->
                 val segment = swing.segment
                 Text(
-                    "${index + 1}. ${segment.durationMs} мс · момент удара ${segment.impactFrame?.let { "кадр ${it}" } ?: "—"} · " +
+                    "${index + 1}. ${if (segment.corrections.isEmpty()) "✓" else "✗ " + segment.corrections.joinToString { it.title.lowercase() }} · " +
+                        "плечи ${segment.shoulderTurnDegrees?.let { "%.0f°".format(it) } ?: "—"} · ${segment.durationMs} мс · момент удара ${segment.impactFrame?.let { "кадр ${it}" } ?: "—"} · " +
                         "колено ${formatMetric(swing.leadingKnee)} · " +
                         "локоть ${formatMetric(swing.leadingElbow)} · наклон корпуса (3D, от вертикали, без знака) ${formatMetric(swing.trunkLean)}",
                     style = MaterialTheme.typography.bodySmall
@@ -238,6 +239,7 @@ private fun MotionChart(
                 color = when {
                     segment.truncated -> Color(0x33FF9800)
                     segment.tooSlow -> Color(0x339E9E9E)
+                    segment.corrections.isNotEmpty() -> Color(0x33E53935)
                     else -> Color(0x332196F3)
                 },
                 topLeft = androidx.compose.ui.geometry.Offset(x(segment.startFrame), 0f),

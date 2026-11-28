@@ -11,14 +11,21 @@ package com.tennisshadowcoach.analysis
  * the follow-through — instead of when the arm is back at rest up to two seconds later.
  */
 class OnlineSwingSegmenter(
-    private val config: MetricsConfig = MetricsConfig()
+    private val config: MetricsConfig = MetricsConfig(),
+    /**
+     * Shoulder turn around a peak, given the sample index of the peak and the last sample available;
+     * null when the caller has no body landmarks (then the arm-only rule is not applied).
+     */
+    private val shoulderTurn: ((peak: Int, lastAvailable: Int) -> Float?)? = null
 ) {
     data class DetectedSwing(
         val startFrame: Int,
         val peakFrame: Int,
         val endFrame: Int,
         /** Maximum rise speed of the coordinate between start and peak, coordinate units per second. */
-        val riseSpeed: Float = 0f
+        val riseSpeed: Float = 0f,
+        /** Counted, but the shoulders barely turned: [SwingCorrection.NO_SHOULDER_TURN]. */
+        val noShoulderTurn: Boolean = false
     )
     data class Update(
         val calibrated: Boolean,
@@ -55,7 +62,7 @@ class OnlineSwingSegmenter(
         require(good.size >= 3) { "Для калибровки нужны видимые точки запястья." }
         val lo = percentile(good, .05f)
         val hi = percentile(good, .95f)
-        require(hi - lo > EPSILON) { "Для калибровки нужны движения с заметным размахом." }
+        require(hi - lo > EPSILON) { "Калибровка: не видно размаха. Сделай 2–3 полных замаха." }
         lower = lo + config.backFrac * (hi - lo)
         upper = lo + config.frontFrac * (hi - lo)
         amplitude = hi - lo
@@ -174,8 +181,13 @@ class OnlineSwingSegmenter(
         return null
     }
 
-    private fun candidate(start: Int, peak: Int, end: Int) =
-        DetectedSwing(samples[start].frame, samples[peak].frame, samples[end].frame, riseSpeed(start, peak))
+    private fun candidate(start: Int, peak: Int, end: Int): DetectedSwing {
+        val turn = shoulderTurn?.invoke(peak, end)
+        return DetectedSwing(
+            samples[start].frame, samples[peak].frame, samples[end].frame, riseSpeed(start, peak),
+            noShoulderTurn = turn != null && turn < config.minShoulderTurnDegrees
+        )
+    }
 
     private fun isTooSlow(swing: DetectedSwing): Boolean =
         referenceSpeed?.let { swing.riseSpeed < config.minSwingSpeedFraction * it } ?: false

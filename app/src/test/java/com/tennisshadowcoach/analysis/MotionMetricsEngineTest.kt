@@ -68,9 +68,12 @@ class MotionMetricsEngineTest {
 
     @Test fun `known recordings stay stable across the full M1 configuration matrix`() {
         val mismatches = mutableListOf<String>()
-        knownRecordings().forEach { recording ->
+        // front_frac 0.4–0.7 (owner's decision 2026-11-28): at 0.8 a real but weaker swing must reach
+        // 80 % of the strongest swings and is lost on 10-front.  Recordings that mix arm-only
+        // movements with swings opt out via "matrix_check": false in their metadata.
+        knownRecordings().filter { it.matrixCheck }.forEach { recording ->
             val frames = CsvPoseFrames.read(recording.csv)
-            for (front in listOf(.4f, .5f, .6f, .7f, .8f)) {
+            for (front in listOf(.4f, .5f, .6f, .7f)) {
                 for (back in listOf(.15f, .2f, .25f, .3f)) {
                     for (window in listOf(5, 9, 17)) {
                         val analysis = MotionMetricsEngine.analyze(
@@ -92,8 +95,13 @@ class MotionMetricsEngineTest {
         knownRecordings().forEach { recording ->
             val frames = CsvPoseFrames.read(recording.csv)
             val offline = analyze(recording)
+            if (offline.swings.size <= 3) return@forEach
             val calibrationEnd = offline.swings[2].endFrame
-            val online = OnlineSwingSegmenter()
+            val config = MetricsConfig()
+            val yaw = ShoulderTurn.yawSeries(frames.map { it.worldLandmarks })
+            val online = OnlineSwingSegmenter(config) { peak, last ->
+                ShoulderTurn.turnDegrees(yaw, peak, config.shoulderTurnBeforeFrames, config.shoulderTurnAfterFrames, last)
+            }
             (0..calibrationEnd).forEach { index ->
                 online.add(frames[index].index, frames[index].timestampUs, offline.debug.coordinate[index])
             }
@@ -113,6 +121,7 @@ class MotionMetricsEngineTest {
         for (calibrationSwings in listOf(2, 3)) knownRecordings().forEach { recording ->
             val frames = CsvPoseFrames.read(recording.csv)
             val offline = analyze(recording)
+            if (offline.swings.size <= calibrationSwings) return@forEach
             val calibrationEnd = offline.swings[calibrationSwings - 1].endFrame
             val tracker = OnlineLiveSwingTracker(recording.leadingHand)
             (0..calibrationEnd).forEach { index ->
@@ -149,8 +158,8 @@ class MotionMetricsEngineTest {
         assertTrue("Gate/speed parameter mismatches:\n${mismatches.joinToString("\n")}", mismatches.isEmpty())
     }
 
-    @Test fun `selfie front recording ignores setup at the phone and the slow racket raise`() {
-        val recording = knownRecordings().single { it.name.contains("front") }
+    @Test fun `selfie front recording ignores setup at the phone and the racket raise`() {
+        val recording = knownRecordings().single { it.name.contains("5-5-front") }
         val frames = CsvPoseFrames.read(recording.csv)
         fun seconds(frame: Int) = (frames[frame].timestampUs - frames.first().timestampUs) / 1_000_000f
         val defaults = analyze(recording)
@@ -161,6 +170,7 @@ class MotionMetricsEngineTest {
         // but is far slower than the swings, so it is recorded and not counted.
         val lowFront = MotionMetricsEngine.analyze(frames, recording.leadingHand, MetricsConfig(frontFrac = .4f))
         val raise = lowFront.debug.allSegments.single { seconds(it.peakFrame) in 5f..7f }
+        // Raising the racket is far slower than the swings: the slow-movement rule excludes it.
         assertTrue(raise.tooSlow)
         assertFalse(raise.counted)
         assertEquals(recording.expectedSwings, lowFront.swings.size)
@@ -196,6 +206,7 @@ class MotionMetricsEngineTest {
         knownRecordings().forEach { recording ->
             val frames = CsvPoseFrames.read(recording.csv)
             val offline = analyze(recording)
+            if (offline.swings.size <= 3) return@forEach
             val calibrationEnd = offline.swings[2].endFrame
             val tracker = OnlineLiveSwingTracker(recording.leadingHand)
             (0..calibrationEnd).forEach { tracker.add(frames[it].index, frames[it].timestampUs, frames[it].landmarks, frames[it].worldLandmarks) }
@@ -217,6 +228,112 @@ class MotionMetricsEngineTest {
         // SPEC M3: a swing is counted no later than ~0.3 s after the coordinate peak
         // ("~": one frame of tolerance at 30 fps).
         assertTrue("max latency ${delays.max()} s", delays.max() <= .35f)
+    }
+
+    @Test fun `live calibration ignores close-up frames at the phone even when they are the majority`() {
+        val failures = mutableListOf<String>()
+        knownRecordings().forEach { recording ->
+            val frames = CsvPoseFrames.read(recording.csv)
+            val offline = analyze(recording)
+            if (offline.swings.size <= 2) return@forEach
+            val calibrationEnd = offline.swings[1].endFrame
+            // Opening the mirror at the phone: the body is twice as large (scaled from the top edge
+            // of the frame), so the legs and feet leave the frame.
+            val closeUp = frames.first { it.landmarks.all { p -> p != null } }.let { template ->
+                template.copy(landmarks = template.landmarks.map { p ->
+                    p?.copy(x = .5f + (p.x - .5f) * 2f, y = p.y * 2f)
+                })
+            }
+            assertTrue(FramingCheck.evaluate(closeUp.landmarks) in setOf(FramingIssue.FEET_CUT, FramingIssue.LEGS_CUT))
+            val tracker = OnlineLiveSwingTracker(recording.leadingHand)
+            val step = 33_333L
+            val closeUpCount = (calibrationEnd + 1) * 2
+            (0 until closeUpCount).forEach { tracker.add(-1, it * step, closeUp.landmarks, closeUp.worldLandmarks) }
+            val shift = closeUpCount * step - frames.first().timestampUs
+            (0..calibrationEnd).forEach { tracker.add(frames[it].index, frames[it].timestampUs + shift, frames[it].landmarks, frames[it].worldLandmarks) }
+            try { tracker.completeCalibration() } catch (e: Throwable) {
+                failures += "${recording.name}: calibration failed: ${e.message}"; return@forEach
+            }
+            (calibrationEnd + 1..frames.lastIndex).forEach { tracker.add(frames[it].index, frames[it].timestampUs + shift, frames[it].landmarks, frames[it].worldLandmarks) }
+            val live = tracker.finish().completedCount
+            if (live != offline.swings.size) failures += "${recording.name}: offline=${offline.swings.size} live=$live"
+        }
+        assertTrue("Close-up calibration mismatches:\n${failures.joinToString("\n")}", failures.isEmpty())
+    }
+
+    @Test fun `framing check reports cut head, cut feet and missing person`() {
+        val standing = List(33) { ImageLandmark(.5f, .5f, 0f, .9f) }.toMutableList().apply {
+            this[0] = ImageLandmark(.5f, .15f, 0f, .9f)
+            this[27] = ImageLandmark(.45f, .9f, 0f, .9f); this[28] = ImageLandmark(.55f, .9f, 0f, .9f)
+        }
+        assertEquals(null, FramingCheck.evaluate(standing))
+        assertEquals(FramingIssue.FEET_CUT, FramingCheck.evaluate(standing.toMutableList().apply { this[27] = ImageLandmark(.45f, 1.05f, 0f, .9f) }))
+        assertEquals(FramingIssue.HEAD_CUT, FramingCheck.evaluate(standing.toMutableList().apply { this[0] = ImageLandmark(.5f, -.02f, 0f, .9f) }))
+        assertEquals(FramingIssue.NO_PERSON, FramingCheck.evaluate(List(33) { null }))
+        // At the phone: face and shoulders visible, hips below the frame.
+        assertEquals(FramingIssue.LEGS_CUT, FramingCheck.evaluate(standing.toMutableList().apply {
+            this[23] = ImageLandmark(.45f, 1.3f, 0f, .2f); this[24] = ImageLandmark(.55f, 1.3f, 0f, .2f)
+        }))
+        val far = standing.toMutableList().apply {
+            this[0] = ImageLandmark(.5f, .5f, 0f, .9f)
+            this[27] = ImageLandmark(.48f, .7f, 0f, .9f); this[28] = ImageLandmark(.52f, .7f, 0f, .9f)
+        }
+        assertEquals(FramingIssue.TOO_FAR, FramingCheck.evaluate(far))
+    }
+
+    @Test fun `arm-only movements are counted with a no-shoulder-turn correction`() {
+        val recording = knownRecordings().single { it.name.contains("2of8") }
+        val analysis = analyze(recording)
+        val swings = analysis.swings
+        println("2of8: " + swings.joinToString { "%.0f°%s".format(it.shoulderTurnDegrees, if (it.corrections.isEmpty()) "" else "!") })
+        assertEquals(8, swings.size)
+        assertTrue(swings.take(6).all { it.corrections == listOf(SwingCorrection.NO_SHOULDER_TURN) })
+        assertTrue(swings.drop(6).all { it.corrections.isEmpty() })
+    }
+
+    @Test fun `live counter flags arm-only movements`() {
+        val recording = knownRecordings().single { it.name.contains("2of8") }
+        val frames = CsvPoseFrames.read(recording.csv)
+        val windows = analyze(recording).debug.allSegments
+        // Calibrate on the arm-only movements, then the two full swings follow.
+        val calibrationEnd = windows[5].endFrame
+        val tracker = OnlineLiveSwingTracker(recording.leadingHand)
+        (0..calibrationEnd).forEach { tracker.add(frames[it].index, frames[it].timestampUs, frames[it].landmarks, frames[it].worldLandmarks) }
+        val calibration = tracker.completeCalibration().completedCount
+        val flagged = mutableListOf<Boolean>()
+        (calibrationEnd + 1..frames.lastIndex).forEach {
+            val state = tracker.add(frames[it].index, frames[it].timestampUs, frames[it].landmarks, frames[it].worldLandmarks)
+            if (state.justCompleted) flagged += state.corrections.isNotEmpty()
+        }
+        val counted = tracker.finish().completedCount
+        val detected = tracker.detectedSwings()
+        println("2of8 live: calibration=$calibration count=$counted flags=$flagged windows=${detected.map { it.peakFrame to it.noShoulderTurn }}")
+        // The six arm-only movements are counted during calibration and carry the correction.
+        assertEquals(6, calibration)
+        assertTrue(detected.filter { it.peakFrame <= calibrationEnd }.all { it.noShoulderTurn })
+        // Swings 7–8 reach only ~0.6 of the amplitude set by the arm-only calibration, so one may
+        // stay below the threshold (thresholds relative to the calibration, SPEC section 5); the
+        // ones counted after calibration have a shoulder turn and no correction.
+        assertTrue(flagged.none { it })
+        assertTrue("count=$counted", counted in 7..8)
+    }
+
+    @Test fun `no-shoulder-turn correction is stable for thresholds 37 to 42 degrees and spans 1 to 1 point 4 s`() {
+        val mismatches = mutableListOf<String>()
+        knownRecordings().forEach { recording ->
+            val frames = CsvPoseFrames.read(recording.csv)
+            for (threshold in listOf(37f, 40f, 42f)) for (span in listOf(1f, 1.2f, 1.4f)) {
+                val swings = MotionMetricsEngine.analyze(
+                    frames, recording.leadingHand,
+                    MetricsConfig(minShoulderTurnDegrees = threshold, shoulderTurnBeforePeakSeconds = span)
+                ).swings
+                val flagged = swings.count { SwingCorrection.NO_SHOULDER_TURN in it.corrections }
+                if (swings.size != recording.expectedSwings || flagged != recording.expectedNoShoulderTurn) {
+                    mismatches += "${recording.name}: threshold=$threshold span=$span swings=${swings.size} flagged=$flagged"
+                }
+            }
+        }
+        assertTrue("Shoulder-turn mismatches:\n${mismatches.joinToString("\n")}", mismatches.isEmpty())
     }
 
     @Test fun `impact is 0 point 1 to 0 point 45 seconds before coordinate peak for all labelled swings`() {
@@ -326,7 +443,9 @@ class MotionMetricsEngineTest {
                 val hand = if (metadataText.contains("\"leading_hand\"\\s*:\\s*\"left\"".toRegex())) LeadingHand.LEFT else LeadingHand.RIGHT
                 val declaredAngle = DECLARED_ANGLE.find(metadataText)?.groupValues?.get(1) ?: "unspecified"
                 val phoneSide = PHONE_SIDE.find(metadataText)?.groupValues?.get(1) ?: "unspecified"
-                KnownRecording(csv.name, csv, expected, hand, declaredAngle, phoneSide)
+                val noTurn = EXPECTED_NO_TURN.find(metadataText)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                val matrix = !metadataText.contains("\"matrix_check\"\\s*:\\s*false".toRegex())
+                KnownRecording(csv.name, csv, expected, hand, declaredAngle, phoneSide, noTurn, matrix)
             }
         }
             .sortedBy { it.name }
@@ -379,7 +498,10 @@ class MotionMetricsEngineTest {
         val leadingHand: LeadingHand,
         /** What the owner declared for diagnostics; the analysis itself never reads it. */
         val declaredAngle: String,
-        val phoneSide: String
+        val phoneSide: String,
+        /** Swings the owner marked as arm-only: they must carry the no-shoulder-turn correction. */
+        val expectedNoShoulderTurn: Int = 0,
+        val matrixCheck: Boolean = true
     )
     private data class LegacyVec(val x: Float, val y: Float, val z: Float) {
         fun distanceTo(other: LegacyVec): Float = kotlin.math.sqrt(
@@ -389,6 +511,7 @@ class MotionMetricsEngineTest {
 
     private companion object {
         val EXPECTED_SWINGS = Regex("\\\"expected_swings\\\"\\s*:\\s*(\\d+)")
+        val EXPECTED_NO_TURN = Regex("\"expected_no_shoulder_turn\"\\s*:\\s*(\\d+)")
         val DECLARED_ANGLE = Regex("\"recording_angle\"\\s*:\\s*\"([a-z_0-9]+)\"")
         val PHONE_SIDE = Regex("\"phone_side\"\\s*:\\s*\"([a-z_]+)\"")
     }

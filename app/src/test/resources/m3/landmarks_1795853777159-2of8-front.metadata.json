@@ -1,0 +1,44 @@
+{
+  "video": {
+    "width": 1280,
+    "height": 720,
+    "rotation_degrees": 270
+  },
+  "pose_model": "lite",
+  "camera": "selfie",
+  "recording_angle": "front",
+  "phone_side": "unspecified",
+  "leading_hand": "right",
+  "expected_swings": 8,
+  "manual_counts": {
+    "with_pauses": null,
+    "continuous": null
+  },
+  "detected_view": {
+    "view": "facing",
+    "camera_side": "trailing",
+    "hip_yaw_degrees": 15.95,
+    "shoulder_yaw_degrees": 19.4,
+    "image_shoulder_width_to_torso": 0.63,
+    "rest_frames": 173
+  },
+  "config": {
+    "visibility_threshold": 0.5,
+    "outlier_median_window_frames": 7,
+    "outlier_median_deviation_torso_lengths": 0.35,
+    "max_interpolation_gap_frames": 6,
+    "speed_smoothing_window_frames": 5,
+    "angle_smoothing_window_frames": 9,
+    "swing_coordinate_smoothing_window_frames": 9,
+    "front_frac": 0.6,
+    "back_frac": 0.25,
+    "in_position_torso_tolerance": 0.25,
+    "min_in_position_seconds": 1.0,
+    "min_swing_speed_fraction": 0.3,
+    "leading_hand": "right"
+  },
+  "metadata_note": "Разметка владельца 2026-11-28: 8 замахов. 1-4 — удар вперёд без замаха, 5-6 — лёгкий мах рукой в плоскости, 7-8 — «более-менее», плечи немного разворачивались назад. Считаются все 8; у 1-6 должно быть замечание «нет разворота плеч».",
+  "expected_no_shoulder_turn": 6,
+  "matrix_check": false,
+  "matrix_check_note": "Ролик смешивает махи рукой (1-6) и замахи с разворотом плеч (7-8); пороги от размаха всего ролика задают махи рукой, поэтому при крайних порогах 7-8 теряются или 1-2 склеиваются. Проверяется счёт по умолчанию и замечания."
+}
