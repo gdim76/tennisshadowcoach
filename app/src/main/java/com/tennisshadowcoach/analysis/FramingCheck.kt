@@ -1,12 +1,12 @@
 package com.tennisshadowcoach.analysis
 
 /** Why the current frame is not usable for counting; null when the whole body is visible. */
-enum class FramingIssue(val label: String) {
-    NO_PERSON("Нет человека в кадре"),
-    HEAD_CUT("Не видно головы — отойди дальше"),
-    FEET_CUT("Не видно стоп — отойди дальше или поставь телефон ниже"),
-    LEGS_CUT("Видно только верх — отойди дальше или поставь телефон ниже"),
-    TOO_FAR("Слишком далеко — подойди ближе")
+enum class FramingIssue(val label: String, val spoken: String) {
+    NO_PERSON("Нет человека в кадре", "Встань в кадр"),
+    HEAD_CUT("Не видно головы — отойди дальше", "Не видно головы, отойди дальше"),
+    FEET_CUT("Не видно стоп — отойди дальше или поставь телефон ниже", "Не видно стоп, отойди дальше"),
+    LEGS_CUT("Видно только верх — отойди дальше или поставь телефон ниже", "Отойди дальше"),
+    TOO_FAR("Слишком далеко — подойди ближе", "Подойди ближе")
 }
 
 /**

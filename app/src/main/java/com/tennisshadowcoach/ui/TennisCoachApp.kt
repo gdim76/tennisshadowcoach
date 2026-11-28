@@ -223,7 +223,7 @@ fun TennisCoachApp() {
                     }
                 },
                 modifier = Modifier.fillMaxWidth()
-            ) { Text("Открыть зеркало (подготовка M3)") }
+            ) { Text("Открыть зеркало") }
             if (recordingMetadata.leadingHand == null) {
                 Text("Для зеркала сначала выбери ведущую руку в метаданных.", style = MaterialTheme.typography.bodySmall)
             }

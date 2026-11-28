@@ -2,9 +2,21 @@ package com.tennisshadowcoach.ui
 
 import android.media.AudioManager
 import android.media.ToneGenerator
+import android.Manifest
+import android.content.pm.PackageManager
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.OutlinedButton
+import com.tennisshadowcoach.analysis.MirrorPhase
+import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.material3.TextButton
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -52,13 +64,38 @@ import com.tennisshadowcoach.analysis.LeadingHand
 import com.tennisshadowcoach.analysis.LivePoseAnalyzer
 import com.tennisshadowcoach.analysis.LivePoseState
 
-/** M3 preparation: pose preview and repeat count only.  It intentionally has no coaching cues. */
+/**
+ * The mirror: live pose, framing frame, swing count, a verdict per swing (M3) and voice prompts (M4).
+ * The phone stands 2.5–3 m away, so feedback is mainly audible: a beep for a clean swing and a short
+ * spoken correction for a wrong one.
+ */
 @Composable
 fun LiveMirrorScreen(leadingHand: LeadingHand, onBack: () -> Unit) {
     val context = LocalContext.current
     var poseState by remember { mutableStateOf(LivePoseState()) }
     var mirrored by remember { mutableStateOf(true) }
-    var soundOn by remember { mutableStateOf(true) }
+    val preferences = remember(context) { CapturePreferences(context) }
+    var feedback by remember { mutableStateOf(preferences.loadFeedback()) }
+    fun updateFeedback(updated: MirrorFeedback) {
+        feedback = updated
+        preferences.saveFeedback(updated)
+    }
+    var voiceStatus by remember { mutableStateOf<String?>(null) }
+    var listenStatus by remember { mutableStateOf<VoiceCommandListener.Status?>(null) }
+    var heard by remember { mutableStateOf<String?>(null) }
+    var commandListener: VoiceCommandListener? by remember { mutableStateOf(null) }
+    var voices by remember { mutableStateOf<List<String>>(emptyList()) }
+    var currentVoice by remember { mutableStateOf<String?>(null) }
+    val voice = remember(context) {
+        VoiceCoach(
+            context,
+            preferredVoice = feedback.voiceName,
+            onStatus = { status -> voiceStatus = status },
+            onVoices = { names, current -> voices = names; currentVoice = current },
+            onSpeaking = { speaking -> commandListener?.setPaused(speaking) }
+        )
+    }
+    DisposableEffect(voice) { onDispose { voice.close() } }
     // A short tone on each counted swing: the screen is too small to read from 2.5–3 m.
     val tone = remember { runCatching { ToneGenerator(AudioManager.STREAM_MUSIC, 80) }.getOrNull() }
     DisposableEffect(tone) { onDispose { tone?.release() } }
@@ -67,12 +104,48 @@ fun LiveMirrorScreen(leadingHand: LeadingHand, onBack: () -> Unit) {
         LivePoseAnalyzer(context, leadingHand) { poseState = it }
     }
     DisposableEffect(analyzer) { onDispose { analyzer.close() } }
+    LaunchedEffect(analyzer, voice) { analyzer.onPrompt = voice::speak }
+    val listener = remember(context, analyzer) {
+        VoiceCommandListener(
+            context,
+            onCommand = analyzer::handle,
+            onStatus = { status -> listenStatus = status },
+            onHeard = { text, final ->
+                heard = text
+                if (final) analyzer.logHeard(text)
+            }
+        )
+    }
+    DisposableEffect(listener) {
+        commandListener = listener
+        onDispose { listener.close() }
+    }
+    var micGranted by remember {
+        mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
+    }
+    val micPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        micGranted = granted
+        if (!granted) listenStatus = VoiceCommandListener.Status("Без доступа к микрофону голосовые команды не работают — управляй кнопками.")
+    }
+    LaunchedEffect(feedback.listen, micGranted) {
+        when {
+            !feedback.listen -> listener.stop()
+            !micGranted -> micPermission.launch(Manifest.permission.RECORD_AUDIO)
+            else -> listener.start()
+        }
+    }
+    LaunchedEffect(feedback) {
+        analyzer.voiceEnabled = feedback.voice
+        analyzer.framingPromptsEnabled = feedback.framingPrompts
+        if (!feedback.voice) voice.stop()
+    }
     BackHandler { analyzer.finishSession(); onBack() }
-    // One short beep for a good swing, a low double tone for a swing with a correction.
+    // A short beep for a good swing.  A swing with a correction gets a low double tone, unless the
+    // voice is on: then the spoken correction replaces it instead of talking over it.
     LaunchedEffect(poseState.lastSwingNumber) {
-        if (poseState.calibrated && poseState.lastSwingNumber > lastCount && soundOn) {
+        if (poseState.calibrated && poseState.lastSwingNumber > lastCount && feedback.sound) {
             if (poseState.lastSwingCorrections.isEmpty()) tone?.startTone(ToneGenerator.TONE_PROP_BEEP, 150)
-            else tone?.startTone(ToneGenerator.TONE_PROP_NACK, 400)
+            else if (!feedback.voice) tone?.startTone(ToneGenerator.TONE_PROP_NACK, 400)
         }
         lastCount = poseState.lastSwingNumber
     }
@@ -84,38 +157,36 @@ fun LiveMirrorScreen(leadingHand: LeadingHand, onBack: () -> Unit) {
         onDispose { view.keepScreenOn = wasKeepingScreenOn }
     }
 
+    var settingsOpen by remember { mutableStateOf(false) }
+    // Green: whole body visible (and, during a set, at the calibrated distance).
+    // Amber: visible but away from the calibrated spot, so swings are not counted.
+    // Red: head or feet cut off, or nobody in the frame.
+    val training = poseState.phase == MirrorPhase.TRAINING
+    val frameColor = when {
+        poseState.framing != null -> Color(0xFFE53935)
+        training && !poseState.inPosition -> Color(0xFFFFB300)
+        else -> Color(0xFF43A047)
+    }
+    val frameText = when {
+        poseState.framing != null -> poseState.framing!!.label
+        training && !poseState.inPosition -> "Встань на место, где проходила калибровка"
+        else -> "В кадре целиком"
+    }
+
     Column(
-        Modifier.fillMaxSize().systemBarsPadding().padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
+        Modifier.fillMaxSize().systemBarsPadding().padding(horizontal = 8.dp, vertical = 4.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = { analyzer.finishSession(); onBack() }) {
-                Icon(Icons.Default.ArrowBack, contentDescription = null)
+                Icon(Icons.Default.ArrowBack, contentDescription = "Назад")
             }
-            Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)) {
-                Text("Зеркало — подготовка M3", style = MaterialTheme.typography.titleLarge)
-                Text("Счёт замахов. Подсказки по правилам пока выключены.", style = MaterialTheme.typography.bodySmall)
-            }
+            Text("Зеркало", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
+            TextButton(onClick = { settingsOpen = !settingsOpen }) { Text(if (settingsOpen) "Скрыть настройки" else "Настройки") }
         }
 
-        // Green: whole body visible (and, after calibration, at the working distance).
-        // Amber: visible but not at the calibrated distance, so swings are not counted.
-        // Red: head or feet cut off, or nobody in the frame.
-        val frameColor = when {
-            poseState.framing != null -> Color(0xFFE53935)
-            poseState.calibrated && !poseState.inPosition -> Color(0xFFFFB300)
-            else -> Color(0xFF43A047)
-        }
-        val frameText = when {
-            poseState.framing != null -> poseState.framing!!.label
-            poseState.calibrated && !poseState.inPosition -> "Встань на место, где проходила калибровка"
-            poseState.calibrated -> "В кадре целиком — замахи считаются"
-            else -> "В кадре целиком — сделай 2–3 замаха и заверши калибровку"
-        }
-
-        // The preview takes the remaining height and clips the skeleton, so the counter and the
-        // calibration button always stay on screen (the column does not scroll).
+        // The preview takes almost the whole screen; the information sits on top of it so the
+        // picture stays large.  The whole camera frame is shown (FIT_CENTER), as the model sees it.
         Box(
             Modifier.fillMaxWidth().weight(1f)
                 .border(6.dp, frameColor)
@@ -124,54 +195,98 @@ fun LiveMirrorScreen(leadingHand: LeadingHand, onBack: () -> Unit) {
         ) {
             LiveCameraPreview(analyzer, mirrored, Modifier.fillMaxSize())
             SkeletonOverlay(poseState, mirrored, Modifier.fillMaxSize())
-        }
-        Text(frameText, color = frameColor, style = MaterialTheme.typography.titleMedium)
-
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                "Замахов: ${poseState.swingCount}",
-                style = MaterialTheme.typography.displaySmall,
-                modifier = Modifier.weight(1f)
-            )
-            Column(horizontalAlignment = Alignment.End) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Звук", style = MaterialTheme.typography.bodySmall)
-                    Spacer(Modifier.width(4.dp))
-                    Switch(checked = soundOn, onCheckedChange = { soundOn = it })
+            Column(
+                Modifier.align(Alignment.TopStart).fillMaxWidth()
+                    .background(Color(0x99000000)).padding(8.dp)
+            ) {
+                Text(frameText, color = frameColor, style = MaterialTheme.typography.titleMedium)
+                Text(poseState.phase.label, color = Color.White, style = MaterialTheme.typography.bodyMedium)
+                if (feedback.listen && listenStatus == null) {
+                    Text("Слышу: ${heard ?: "…"}", color = Color(0xFFB3E5FC), style = MaterialTheme.typography.bodySmall)
                 }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Зеркально", style = MaterialTheme.typography.bodySmall)
-                    Spacer(Modifier.width(4.dp))
-                    Switch(checked = mirrored, onCheckedChange = { mirrored = it })
+            }
+            Column(
+                Modifier.align(Alignment.BottomStart).fillMaxWidth()
+                    .background(Color(0x99000000)).padding(8.dp)
+            ) {
+                Text("Замахов: ${poseState.swingCount}", color = Color.White, style = MaterialTheme.typography.headlineMedium)
+                if (poseState.lastSwingNumber > 0) {
+                    val good = poseState.lastSwingCorrections.isEmpty()
+                    Text(
+                        if (good) "Замах ${poseState.lastSwingNumber}: ✓ с разворотом плеч"
+                        else "Замах ${poseState.lastSwingNumber}: ✗ " + poseState.lastSwingCorrections.joinToString { it.title.lowercase() },
+                        color = if (good) Color(0xFF69F0AE) else Color(0xFFFF8A80),
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Text(
+                        "Без замечаний: ${poseState.swingCount - poseState.correctedSwings} из ${poseState.swingCount}",
+                        color = Color.White, style = MaterialTheme.typography.bodySmall
+                    )
                 }
             }
         }
-        if (poseState.lastSwingNumber > 0) {
-            val good = poseState.lastSwingCorrections.isEmpty()
+
+        if (settingsOpen) {
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                FilterChip(feedback.listen, { updateFeedback(feedback.copy(listen = !feedback.listen)) }, label = { Text("Микрофон") })
+                FilterChip(feedback.voice, { updateFeedback(feedback.copy(voice = !feedback.voice)) }, label = { Text("Голос") })
+                FilterChip(
+                    feedback.framingPrompts,
+                    { updateFeedback(feedback.copy(framingPrompts = !feedback.framingPrompts)) },
+                    label = { Text("Подсказки о кадре") },
+                    enabled = feedback.voice
+                )
+                FilterChip(feedback.sound, { updateFeedback(feedback.copy(sound = !feedback.sound)) }, label = { Text("Звук") })
+                FilterChip(mirrored, { mirrored = !mirrored }, label = { Text("Зеркально") })
+            }
+            if (voices.isNotEmpty()) {
+                Text("Голос подсказок (нажми, чтобы послушать):", style = MaterialTheme.typography.bodySmall)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    voices.forEachIndexed { index, name ->
+                        FilterChip(
+                            name == currentVoice,
+                            {
+                                voice.useVoice(name)
+                                currentVoice = name
+                                updateFeedback(feedback.copy(voiceName = name))
+                            },
+                            label = { Text("${index + 1}") }
+                        )
+                    }
+                }
+            }
             Text(
-                if (good) "Замах ${poseState.lastSwingNumber}: ✓ с разворотом плеч"
-                else "Замах ${poseState.lastSwingNumber}: ✗ " + poseState.lastSwingCorrections.joinToString { it.title.lowercase() },
-                color = if (good) Color(0xFF43A047) else MaterialTheme.colorScheme.error,
-                style = MaterialTheme.typography.titleLarge
+                "Голосовые команды: «start calibration» · «ready» (или «finish calibration») · «start» · «stop»",
+                style = MaterialTheme.typography.bodySmall
             )
-            if (!good) Text(poseState.lastSwingCorrections.first().advice)
             Text(
-                "Без замечаний: ${poseState.swingCount - poseState.correctedSwings} из ${poseState.swingCount}",
+                "Обработка: ${"%.1f".format(poseState.framesPerSecond)} кадр/с · кадров: ${poseState.analysedFrames}",
                 style = MaterialTheme.typography.bodySmall
             )
         }
-        poseState.notice?.let {
-            Text(it, color = if (poseState.noticeIsError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
+        voiceStatus?.takeIf { feedback.voice }?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+        listenStatus?.takeIf { feedback.listen }?.let { status ->
+            Text(status.message, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
         }
-        Text(
-            "Обработка: ${"%.1f".format(poseState.framesPerSecond)} кадр/с · кадров: ${poseState.analysedFrames}",
-            style = MaterialTheme.typography.bodySmall
-        )
-        Button(
-            onClick = { analyzer.completeCalibration() },
-            enabled = !poseState.calibrated && poseState.analysedFrames > 0,
-            modifier = Modifier.fillMaxWidth()
-        ) { Text("Завершить калибровку после 2–3 замахов") }
+        poseState.notice?.let {
+            Text(
+                it,
+                color = if (poseState.noticeIsError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                style = MaterialTheme.typography.bodySmall
+            )
+        }
+        // The same actions as the voice commands, for when the phone is within reach.
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            when (poseState.phase) {
+                MirrorPhase.IDLE -> Button({ analyzer.startCalibration() }, Modifier.weight(1f)) { Text("Старт калибровки") }
+                MirrorPhase.CALIBRATING -> Button({ analyzer.completeCalibration() }, Modifier.weight(1f)) { Text("Завершить калибровку") }
+                MirrorPhase.READY -> {
+                    Button({ analyzer.startTraining() }, Modifier.weight(1f)) { Text("Старт подхода") }
+                    OutlinedButton({ analyzer.startCalibration() }, Modifier.weight(1f)) { Text("Калибровать заново") }
+                }
+                MirrorPhase.TRAINING -> Button({ analyzer.stopTraining() }, Modifier.weight(1f)) { Text("Стоп") }
+            }
+        }
         poseState.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
     }
 }
@@ -186,12 +301,20 @@ private fun LiveCameraPreview(analyzer: LivePoseAnalyzer, mirrored: Boolean, mod
         modifier = modifier,
         factory = { viewContext ->
             PreviewView(viewContext).also { previewView ->
+                // Show the whole camera frame (no crop): what is on screen is what the model sees.
+                // Preview and analysis share the 4:3 aspect so the overlay lines up exactly.
+                previewView.scaleType = PreviewView.ScaleType.FIT_CENTER
+                val sameAspect = ResolutionSelector.Builder()
+                    .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                    .build()
                 val future = ProcessCameraProvider.getInstance(context)
                 future.addListener({
                     runCatching {
                         provider = future.get()
-                        val preview = Preview.Builder().build().also { it.surfaceProvider = previewView.surfaceProvider }
+                        val preview = Preview.Builder().setResolutionSelector(sameAspect).build()
+                            .also { it.surfaceProvider = previewView.surfaceProvider }
                         val imageAnalysis = ImageAnalysis.Builder()
+                            .setResolutionSelector(sameAspect)
                             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                             .build()
                             .also { it.setAnalyzer(executor, analyzer) }
@@ -216,8 +339,14 @@ private fun LiveCameraPreview(analyzer: LivePoseAnalyzer, mirrored: Boolean, mod
 @Composable
 private fun SkeletonOverlay(state: LivePoseState, mirrored: Boolean, modifier: Modifier) {
     Canvas(modifier) {
+        // The preview is letterboxed (FIT_CENTER): draw inside the same centred rectangle.
+        val aspect = if (state.imageWidth > 0 && state.imageHeight > 0) state.imageWidth.toFloat() / state.imageHeight else 3f / 4f
+        val drawWidth = minOf(size.width, size.height * aspect)
+        val drawHeight = drawWidth / aspect
+        val left = (size.width - drawWidth) / 2f
+        val top = (size.height - drawHeight) / 2f
         fun point(index: Int): Offset? = state.landmarks.getOrNull(index)?.let { landmark ->
-            Offset((if (mirrored) 1f - landmark.x else landmark.x) * size.width, landmark.y * size.height)
+            Offset(left + (if (mirrored) 1f - landmark.x else landmark.x) * drawWidth, top + landmark.y * drawHeight)
         }
         SKELETON_CONNECTIONS.forEach { (from, to) ->
             val a = point(from); val b = point(to)

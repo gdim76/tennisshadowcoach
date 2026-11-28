@@ -22,6 +22,7 @@ if [[ "${1:-}" == "--list" ]]; then
   exit 0
 fi
 
+newest_live=$(grep -o '^live_[0-9]*' <<<"$files" | sort | tail -1 || true)
 mkdir -p "$LOCAL"
 pulled=0
 for name in $files; do
@@ -34,10 +35,13 @@ for name in $files; do
     echo "пропущен $name: анализ ещё не закончен"
     continue
   fi
-  # A live session is complete once the mirror was closed: its events file has a "finish" line.
+  # A live session is complete once the mirror was closed (its events file has a "finish" line).
+  # Without it, the session is still open only if it is the newest one and the app is running;
+  # otherwise the app was killed (e.g. reinstalled) and the file is as complete as it gets.
   if [[ "$name" == live_* ]]; then
     session="${name%%.*}"
-    if ! adb shell grep -q ",finish," "$REMOTE/$session.events.csv" 2>/dev/null; then
+    if ! adb shell grep -q ",finish," "$REMOTE/$session.events.csv" 2>/dev/null &&
+       [[ "$session" == "$newest_live" ]] && adb shell pidof com.tennisshadowcoach >/dev/null 2>&1; then
       echo "пропущен $name: «Зеркало» ещё открыто"
       continue
     fi
