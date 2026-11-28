@@ -27,6 +27,9 @@ CFG = dict(
     torso_tol=0.25,      # подготовка: размер торса в кадре вне [1/1.25, 1.25] от медианы записи (устойчиво 0.2-0.4)
     min_in_pos_s=1.0,    # отрезки «на месте» короче этого — тоже подготовка (устойчиво 0.5-2 с)
     min_speed_frac=0.3,  # замах: скорость подъёма >= доли медианы по кандидатам (устойчиво 0.2-0.4)
+    min_shoulder_turn=40.0,  # замах с разворотом плеч не меньше этого (иначе замечание); устойчиво 37-42
+    shoulder_pre_s=1.2,      # разворот плеч ищется от этого времени до пика координаты ...
+    shoulder_post_s=0.1,     # ... до этого времени после пика
     leading="right",
 )
 
@@ -140,8 +143,36 @@ def rise_speed(z, swing, win=5, c=CFG):
     zz = np.where(np.isnan(z), np.nanmin(z), z)
     return float(savgol_filter(zz, win, 2, deriv=1, delta=1.0 / c["fps"])[a:p + 1].max())
 
-def run(path, c=CFG):
-    """Возвращает t, z, все окна и засчитанные замахи (полные и не медленные)."""
+def shoulder_yaw(df):
+    """Поворот линии плеч в горизонтальной плоскости world x-z, градусы, без скачков через ±180°;
+    кадры без позы интерполируются."""
+    dx = (df["world_11_x"] - df["world_12_x"]).values
+    dz = (df["world_11_z"] - df["world_12_z"]).values
+    a = np.arctan2(dz, dx)
+    ok = ~np.isnan(a)
+    idx = np.arange(len(a))
+    return np.degrees(np.interp(idx, idx[ok], np.unwrap(a[ok])))
+
+def shoulder_turn(yaw, swing, c=CFG):
+    """Размах поворота плеч вокруг замаха: от shoulder_pre_s до пика координаты до shoulder_post_s после
+    него; 95-й минус 5-й перцентиль, чтобы одиночные сбои трекинга не считались. Отрезок привязан к пику,
+    а не к началу окна: иначе склеенное окно из двух коротких движений (рука не вернулась в покой)
+    захватывает оба и набирает лишний поворот.
+    Полный удар справа начинается с разворота плеч назад; у «удара без замаха» и лёгкого маха рукой
+    плечи почти не поворачиваются (30-36° против 45-130° у полных замахов на размеченных роликах)."""
+    _, p, _ = swing
+    seg = yaw[max(0, p - int(c["shoulder_pre_s"] * c["fps"])): min(len(yaw), p + int(c["shoulder_post_s"] * c["fps"]) + 1)]
+    return float(np.percentile(seg, 95) - np.percentile(seg, 5))
+
+def corrections(yaw, swing, c=CFG):
+    """Замечания к засчитанному замаху (замах всё равно считается: это тренажёр, а не фильтр)."""
+    out = []
+    if shoulder_turn(yaw, swing, c) < c["min_shoulder_turn"]:
+        out.append("нет разворота плеч: начни замах с разворота плеч и корпуса боком к сетке")
+    return out
+
+def classify(path, c=CFG):
+    """Окна замахов и причина, по которой окно не засчитано (None — засчитано)."""
     df = pd.read_csv(path)
     t = (df.timestamp_us.values - df.timestamp_us.values[0]) / 1e6
     k = c["wrist"]
@@ -150,18 +181,26 @@ def run(path, c=CFG):
     P = clean_track(P, np.where(mask, df[f"image_{k}_visibility"].values, 0.0), torso_length(df), c)
     z = swing_coordinate(P, c, trailing_side(df, mask, c))
     sw = detect_swings(z, c)
-    full = [s for s in sw if is_complete(s, z, c)]
+    reason = {s: None if is_complete(s, z, c) else "обрезан записью/подготовкой" for s in sw}
+    full = [s for s in sw if reason[s] is None]
     if full:   # медленный подъём ракетки в готовую позицию — цикл положения, но не замах
         speeds = np.array([rise_speed(z, s, c=c) for s in full])
-        full = [s for s, v in zip(full, speeds) if v >= c["min_speed_frac"] * np.median(speeds)]
-    return t, z, sw, full
+        for s, v in zip(full, speeds):
+            if v < c["min_speed_frac"] * np.median(speeds):
+                reason[s] = "медленное движение"
+    return t, z, sw, reason
+
+def run(path, c=CFG):
+    """Возвращает t, z, все окна и засчитанные замахи (полные, с разворотом плеч и не медленные)."""
+    t, z, sw, reason = classify(path, c)
+    return t, z, sw, [s for s in sw if reason[s] is None]
 
 if __name__ == "__main__":
-    t, z, sw, full = run(sys.argv[1])
-    print(f"найдено окон {len(sw)}, засчитано {len(full)}")
+    t, z, sw, reason = classify(sys.argv[1])
+    print(f"найдено окон {len(sw)}, засчитано {sum(r is None for r in reason.values())}")
     for s in sw:
         a, p, b = s
-        tag = "" if s in full else ("  (обрезан записью/подготовкой)" if not is_complete(s, z) else "  (медленное движение)")
+        tag = f"  ({reason[s]})" if reason[s] else ""
         print(f"  начало {t[a]:5.2f}  пик {t[p]:5.2f}  конец {t[b]:5.2f} с{tag}")
 
 

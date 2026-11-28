@@ -370,11 +370,21 @@ private fun AnalysisResultCard(
             MetricRow("Кадры с найденной позой", "${analysis.detectedPoseFrames} из ${analysis.processedFrames}")
             MetricRow("Скорость обработки", "${"%.1f".format(analysis.processingFps)} кадр/с")
             MetricRow("Найдено замахов", analysis.motion.swings.size.toString())
+            val corrected = analysis.motion.swings.count { it.corrections.isNotEmpty() }
+            if (analysis.motion.swings.isNotEmpty()) {
+                MetricRow("Без замечаний", "${analysis.motion.swings.size - corrected} из ${analysis.motion.swings.size}")
+            }
             analysis.motion.swings.forEachIndexed { index, swing ->
+                val turn = swing.shoulderTurnDegrees?.let { " · разворот плеч ${"%.0f".format(it)}°" }.orEmpty()
                 Text(
-                    "Замах ${index + 1}: ${swing.durationMs} мс · момент удара ${swing.impactFrame?.let { "кадр $it" } ?: "не найден"}",
-                    style = MaterialTheme.typography.bodySmall
+                    "Замах ${index + 1}: ${if (swing.corrections.isEmpty()) "✓" else "✗ " + swing.corrections.joinToString { it.title.lowercase() }}$turn",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (swing.corrections.isEmpty()) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.error
                 )
+            }
+            // Each correction once, with the advice how to fix it.
+            analysis.motion.swings.flatMap { it.corrections }.distinct().forEach { correction ->
+                Text("${correction.title}: ${correction.advice}", style = MaterialTheme.typography.bodyMedium)
             }
             if (focuses.isNotEmpty()) {
                 Text("Фокусы тренера", style = MaterialTheme.typography.titleMedium)

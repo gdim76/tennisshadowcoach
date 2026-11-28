@@ -92,8 +92,21 @@ data class MetricsConfig(
      * exceed front_frac - back_frac (0.1 at the edge of the tested matrix), so every window
      * reaches it before it closes.
      */
-    val liveCountDropFraction: Float = 0.05f
-)
+    val liveCountDropFraction: Float = 0.05f,
+    /**
+     * A swing without a shoulder turn is still counted, but gets the [SwingCorrection.NO_SHOULDER_TURN]
+     * correction.  A full swing turns the shoulders at least this much (range of the shoulder-line yaw from
+     * [shoulderTurnBeforePeakSeconds] before the coordinate peak to [shoulderTurnAfterPeakSeconds]
+     * after it).  Arm-only movements ("a hit without a backswing", a light wave of the arm) stay
+     * below: 30–36° against 45–130° for full swings.  Same result for 37–42° and spans 1.0–1.4 s.
+     */
+    val minShoulderTurnDegrees: Float = 40f,
+    val shoulderTurnBeforePeakSeconds: Float = 1.2f,
+    val shoulderTurnAfterPeakSeconds: Float = 0.1f
+) {
+    val shoulderTurnBeforeFrames: Int get() = (shoulderTurnBeforePeakSeconds * segmentationFps).toInt()
+    val shoulderTurnAfterFrames: Int get() = (shoulderTurnAfterPeakSeconds * segmentationFps).toInt()
+}
 
 data class MetricReading(
     val world3d: Float?,
@@ -118,9 +131,24 @@ data class SwingSegment(
     val durationMs: Long,
     val truncated: Boolean = false,
     /** Excluded because the rise was much slower than in the other swings of the recording. */
-    val tooSlow: Boolean = false
+    val tooSlow: Boolean = false,
+    /** Range of the shoulder turn around the peak, degrees; see [MetricsConfig.minShoulderTurnDegrees]. */
+    val shoulderTurnDegrees: Float? = null,
+    /** What to correct in this swing.  A swing with corrections is still counted. */
+    val corrections: List<SwingCorrection> = emptyList()
 ) {
     val counted: Boolean get() = !truncated && !tooSlow
+}
+
+/**
+ * A technique correction for a counted swing: the app is a practice coach, so a wrong swing is
+ * counted and told what to fix instead of being dropped.
+ */
+enum class SwingCorrection(val title: String, val advice: String) {
+    NO_SHOULDER_TURN(
+        "Нет разворота плеч",
+        "Начни замах с разворота плеч и корпуса боком к сетке, а не только рукой."
+    )
 }
 
 data class SwingMetrics(
@@ -456,8 +484,16 @@ object MotionMetricsEngine {
         val firstValid = coordinate.indexOfFirst { it != null }
         val lastValid = coordinate.indexOfLast { it != null }
         val tailFrames = (config.trailingPeakExclusionSeconds * config.segmentationFps).toInt()
+        val yaw = ShoulderTurn.yawSeries(frames.map { it.worldLandmarks })
         val bounded = all.map { segment ->
-            segment.copy(truncated = segment.startFrame <= firstValid || segment.peakFrame >= lastValid - tailFrames)
+            val turn = ShoulderTurn.turnDegrees(yaw, segment.peakFrame, config.shoulderTurnBeforeFrames, config.shoulderTurnAfterFrames)
+            segment.copy(
+                truncated = segment.startFrame <= firstValid || segment.peakFrame >= lastValid - tailFrames,
+                shoulderTurnDegrees = turn,
+                corrections = listOfNotNull(
+                    SwingCorrection.NO_SHOULDER_TURN.takeIf { turn != null && turn < config.minShoulderTurnDegrees }
+                )
+            )
         }
         val speeds = bounded.filterNot { it.truncated }.mapNotNull { it.impactCoordinateSpeed }
         val speedFloor = speeds.takeIf { it.isNotEmpty() }?.median()?.times(config.minSwingSpeedFraction)

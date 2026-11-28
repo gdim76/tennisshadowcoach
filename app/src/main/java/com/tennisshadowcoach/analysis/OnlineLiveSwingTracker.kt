@@ -11,24 +11,42 @@ class OnlineLiveSwingTracker(
     private val leadingHand: LeadingHand,
     private val config: MetricsConfig = MetricsConfig()
 ) {
-    data class State(val calibrated: Boolean, val completedCount: Int, val justCompleted: Boolean)
+    data class State(
+        val calibrated: Boolean,
+        val completedCount: Int,
+        val justCompleted: Boolean,
+        /** After calibration: the person stands at the working distance and is being counted. */
+        val inPosition: Boolean = false,
+        /** Corrections of the swing just counted (empty when the swing was fine or none was counted). */
+        val corrections: List<SwingCorrection> = emptyList()
+    )
 
     private data class Sample(
         val frame: Int,
         val timestampUs: Long,
         val point: Vec?,
         val imageTorso: Float?,
-        val world: List<WorldLandmark?>
+        val world: List<WorldLandmark?>,
+        val wholeBody: Boolean
     )
     private val calibration = mutableListOf<Sample>()
     private var mean: Vec? = null
     private var axis: Vec? = null
     private var sign = 1f
     private var segmenter: OnlineSwingSegmenter? = null
-    /** Working-distance image torso length, the median over the calibration frames. */
+    /**
+     * Working-distance image torso length: the median over calibration frames that show the whole
+     * body.  Frames close to the phone (opening the mirror, pressing the button) cut off the feet
+     * and must not set the reference: with few swings they used to be the majority.
+     */
     private var referenceTorso: Float? = null
     private var inPosition = false
     private var positionRun = 0
+    /** Shoulder yaw for every sample fed to the segmenter, calibration included (same indices). */
+    private val yaw = ShoulderTurn.YawTrack()
+    private val shoulderTurn: (Int, Int) -> Float? = { peak, lastAvailable ->
+        ShoulderTurn.turnDegrees(yaw.series, peak, config.shoulderTurnBeforeFrames, config.shoulderTurnAfterFrames, lastAvailable)
+    }
 
     fun add(
         frame: Int,
@@ -41,33 +59,39 @@ class OnlineLiveSwingTracker(
             normalizedRelativeWrist(world.getOrNull(wrist), world)
         } else null
         val torso = MotionMetricsEngine.imageTorsoLength2d(image)
+        yaw.add(world)
         val active = segmenter
         if (active == null) {
-            calibration += Sample(frame, timestampUs, point, torso, world)
+            calibration += Sample(frame, timestampUs, point, torso, world, FramingCheck.wholeBodyVisible(image))
             return State(false, 0, false)
         }
-        val coordinate = point?.takeIf { updatePosition(torso) }?.let { toCoordinate(it) }
+        val positioned = updatePosition(torso)
+        val coordinate = point?.takeIf { positioned }?.let { toCoordinate(it) }
         val update = active.add(frame, timestampUs, coordinate)
-        return State(true, update.completedCount, update.completedSwing != null)
+        return State(true, update.completedCount, update.completedSwing != null, inPosition, update.completedSwing.corrections())
     }
 
     fun completeCalibration(): State {
         // Setup frames (walking away from the phone) are removed exactly as offline: the whole
         // calibration buffer is known, so the non-causal run-length rule can be used here.
-        referenceTorso = calibration.mapNotNull { it.imageTorso }.takeIf { it.isNotEmpty() }?.sorted()?.let { it[it.size / 2] }
+        val wholeBodyTorso = calibration.filter { it.wholeBody }.mapNotNull { it.imageTorso }
+        require(wholeBodyTorso.size >= minPositionRun()) {
+            "Калибровка: тело целиком в кадре меньше секунды. Встань так, чтобы рамка была зелёной, и сделай 2–3 замаха."
+        }
+        referenceTorso = wholeBodyTorso.sorted().let { it[it.size / 2] }
         val positioned = calibrationPositionMask()
         val usable = calibration.mapIndexed { index, sample -> sample.point.takeIf { positioned[index] } }
         inPosition = positioned.lastOrNull() ?: false
         positionRun = if (inPosition) minPositionRun() else 0
         val points = usable.filterNotNull()
-        require(points.size >= 3) { "Для калибровки не хватает видимых точек запястья." }
+        require(points.size >= 3) { "Калибровка: запястье ведущей руки почти не видно. Сделай 2–3 замаха лицом к камере." }
         val centre = Vec(
             points.map { it.x }.average().toFloat(),
             points.map { it.y }.average().toFloat(),
             points.map { it.z }.average().toFloat()
         )
         val mainAxis = principalAxis(points.map { it - centre })
-            ?: error("Для калибровки нужен заметный размах движения.")
+            ?: error("Калибровка: не видно размаха. Сделай 2–3 полных замаха.")
         mean = centre
         axis = mainAxis
         val raw = usable.map { it?.let(::toCoordinateUnflipped) }
@@ -80,7 +104,7 @@ class OnlineLiveSwingTracker(
         sign = if (alignment != null && kotlin.math.abs(alignment) >= SIDE_ALIGNMENT_MIN) {
             if (alignment < 0f) -1f else 1f
         } else if (skew(raw.filterNotNull()) < 0f) -1f else 1f
-        val online = OnlineSwingSegmenter(config)
+        val online = OnlineSwingSegmenter(config, shoulderTurn)
         calibration.forEachIndexed { index, sample ->
             online.add(sample.frame, sample.timestampUs, raw[index]?.times(sign))
         }
@@ -93,8 +117,11 @@ class OnlineLiveSwingTracker(
 
     fun finish(): State {
         val update = segmenter?.finish() ?: return State(false, 0, false)
-        return State(true, update.completedCount, update.completedSwing != null)
+        return State(true, update.completedCount, update.completedSwing != null, inPosition)
     }
+
+    private fun OnlineSwingSegmenter.DetectedSwing?.corrections(): List<SwingCorrection> =
+        if (this?.noShoulderTurn == true) listOf(SwingCorrection.NO_SHOULDER_TURN) else emptyList()
 
     private fun withinTolerance(torso: Float?): Boolean {
         val reference = referenceTorso ?: return true

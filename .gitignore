@@ -10,3 +10,8 @@ local.properties
 # Local test recordings and pose exports. Keep only the directory marker in Git.
 /data/*
 !/data/.gitkeep
+# Diagnostic scripts are versioned; recordings and exports next to them are not.
+!/data/scripts/
+
+# Python venv for data/scripts
+.venv-diag/

@@ -39,6 +39,8 @@ object SwingCsvExporter {
                         number(metrics?.trunkLean?.max),
                         segment.impactFrame?.let { seconds(frames, it) }.orEmpty(),
                         metrics?.unreliableMetricLabels?.joinToString(";", transform = ::csvText).orEmpty(),
+                        number(segment.shoulderTurnDegrees),
+                        segment.corrections.joinToString(";") { csvText(it.title) },
                         exclusionReason(segment)
                     ).joinToString(",")
                 )
@@ -63,5 +65,5 @@ object SwingCsvExporter {
             "колено_в_момент_удара_град,колено_в_пике_координаты_град,колено_мин_град,колено_макс_град," +
             "локоть_в_момент_удара_град,локоть_в_пике_координаты_град,локоть_мин_град,локоть_макс_град," +
             "наклон_корпуса_в_момент_удара_град_3d_от_вертикали_без_знака,наклон_корпуса_в_пике_координаты_град_3d_от_вертикали_без_знака,наклон_корпуса_макс_град_3d_от_вертикали_без_знака," +
-            "время_момента_удара_с,ненадёжные_метрики,не_засчитан_причина"
+            "время_момента_удара_с,ненадёжные_метрики,разворот_плеч_град,замечания,не_засчитан_причина"
 }
